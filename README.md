@@ -96,7 +96,6 @@ BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20240620-v1:0
 
 # API Configuration (for frontend)
 VITE_API_BASE_URL=http://localhost:3000
-VITE_WS_BASE_URL=ws://localhost:3001
 ```
 
 **For AWS Deployment:**
@@ -161,7 +160,7 @@ See [Running Locally](#running-locally) section for detailed instructions.
 
 ## Introduction
 
-**StenoAI** is an AI-powered legal drafting assistant designed to help attorneys and legal staff generate, refine, and export professional demand letters based on firm-approved templates and user-uploaded documents. The platform uses Amazon Bedrock (Claude 3.5 Sonnet) to analyze documents and generate drafts, supports real-time collaboration, and provides a scalable, serverless architecture hosted entirely on AWS.
+**StenoAI** is an AI-powered legal drafting assistant designed to help attorneys and legal staff generate, refine, and export professional demand letters based on firm-approved templates and user-uploaded documents. The platform uses Amazon Bedrock (Claude 3.5 Sonnet) to analyze documents and generate drafts, and provides a scalable, serverless architecture hosted entirely on AWS.
 
 ### What Problem Does It Solve?
 
@@ -169,27 +168,25 @@ Legal professionals face significant challenges:
 
 - **Manual drafting is time-consuming** — Attorneys spend hours drafting demand letters from scratch
 - **Inconsistent formatting** — Manual drafting often fails to maintain firm-wide template standards
-- **Limited collaboration** — Difficult to collaborate on drafts in real-time with team members
 - **Large file handling** — Processing complex, multi-page documents can be slow and unreliable
 
 StenoAI addresses these issues by:
 
 1. **Automating Draft Generation**: AI analyzes uploaded documents and generates drafts using firm-approved templates
 2. **Template Management**: Centralized template system with personal and firm-wide templates
-3. **Real-time Collaboration**: Multiple users can edit documents simultaneously with conflict-free synchronization
-4. **Large File Support**: Intelligent chunking and merging for documents of any size
-5. **Scalable Infrastructure**: Fully serverless AWS architecture that scales automatically
+3. **Large File Support**: Intelligent chunking and merging for documents of any size
+4. **Scalable Infrastructure**: Fully serverless AWS architecture that scales automatically
 
 ### Why Was It Built?
 
-StenoAI was built to streamline the legal drafting process, reduce manual work, and enable seamless collaboration within law firms. By automating the initial draft generation and providing powerful refinement tools, attorneys can focus on strategy and client relationships rather than repetitive writing tasks.
+StenoAI was built to streamline the legal drafting process and reduce manual work. By automating the initial draft generation and providing powerful refinement tools, attorneys can focus on strategy and client relationships rather than repetitive writing tasks.
 
 ### Who Is It For?
 
 **Primary Users:**
 
 - **Attorneys / Legal Staff**: Upload client documents, generate AI-assisted drafts, refine them iteratively, and export polished demand letters
-- **Law Firm Administrators**: Manage templates, oversee team collaboration, and control access permissions
+- **Law Firm Administrators**: Manage templates and control access permissions
 
 ---
 
@@ -225,28 +222,20 @@ StenoAI was built to streamline the legal drafting process, reduce manual work, 
 - **Revision Tracking**: View and restore previous versions of drafts
 - **Idempotent Refinements**: Prevents duplicate refinement operations
 
-### 5. **Real-time Collaboration**
-
-- **Multi-User Editing**: Multiple users can edit documents simultaneously
-- **Y.js CRDT Engine**: Conflict-free concurrent edits with automatic synchronization
-- **WebSocket Communication**: Real-time updates via AWS API Gateway WebSocket API
-- **Presence Indicators**: See active users and their cursor positions
-- **Persistent State**: Document snapshots and operation logs for reliable recovery
-
-### 6. **Export Functionality**
+### 5. **Export Functionality**
 
 - **DOCX Export**: Export drafts to `.docx` format using the `docx` library
 - **Presigned Download URLs**: Secure, time-limited download links (15 min expiry)
 - **Export History**: Track all exports with metadata and expiry dates
 - **Auto-Cleanup**: Exports automatically deleted after 14 days via S3 lifecycle rules
 
-### 7. **Custom Prompts**
+### 6. **Custom Prompts**
 
 - **Reusable Prompts**: Save and manage reusable prompt templates
 - **Prompt Library**: Organize prompts for common refinement tasks
 - **Quick Selection**: Select prompts directly in the editor interface
 
-### 8. **Authentication & Security**
+### 7. **Authentication & Security**
 
 - **JWT-Based Auth**: Secure authentication with httpOnly cookies
 - **Password Hashing**: Bcrypt password hashing with salt rounds
@@ -452,9 +441,6 @@ bash scripts/api_create.sh
 # Build and deploy AI Lambda
 make ai-zip
 bash scripts/ai_create.sh
-
-# Build and deploy WebSocket Lambda (for collaboration)
-# (if separate from API Lambda)
 ```
 
 **API Gateway:**
@@ -462,9 +448,6 @@ bash scripts/ai_create.sh
 ```bash
 # Create HTTP API Gateway
 # (Usually done via api_create.sh script)
-
-# Create WebSocket API Gateway
-bash scripts/ws_create.sh
 ```
 
 **CloudFront Distribution:**
@@ -691,7 +674,6 @@ export BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20240620-v1:0
 
 # Frontend (Vite)
 export VITE_API_BASE_URL=http://localhost:3000
-export VITE_WS_BASE_URL=ws://localhost:3001
 ```
 
 ### Access the Application
@@ -734,7 +716,6 @@ steno-ai-app/
 │   │   │   ├── middleware/  # Auth, errors, idempotency
 │   │   │   ├── db/          # Database connection
 │   │   │   ├── lib/         # Utilities (retry, merge, etc.)
-│   │   │   ├── realtime/    # WebSocket handlers
 │   │   │   └── index.ts     # Express app entry
 │   │   ├── migrations/      # Database migrations
 │   │   ├── dist/            # Build output
@@ -857,12 +838,6 @@ Most endpoints require authentication via JWT token stored in an httpOnly cookie
 - **Description**: Get current user information
 - **Auth**: Required
 - **Response**: `{ "user": { "id": "...", "email": "..." } }`
-
-**GET /auth/ws-token**
-
-- **Description**: Get WebSocket authentication token
-- **Auth**: Required
-- **Response**: `{ "token": "<jwt-token>" }`
 
 #### Documents
 
@@ -1142,44 +1117,6 @@ Most endpoints require authentication via JWT token stored in an httpOnly cookie
   }
   ```
 
-#### WebSocket (Real-time Collaboration)
-
-**Connection**: `wss://<ws-api-id>.execute-api.<region>.amazonaws.com/prod?token=<jwt-token>`
-
-**Messages**:
-
-1. **Join Document**:
-
-   ```json
-   {
-     "action": "join",
-     "documentId": "<uuid>"
-   }
-   ```
-
-2. **Send Update**:
-
-   ```json
-   {
-     "action": "update",
-     "documentId": "<uuid>",
-     "update": "<base64-yjs-update>"
-   }
-   ```
-
-3. **Presence Update** (received):
-   ```json
-   {
-     "action": "presence",
-     "users": [
-       {
-         "userId": "...",
-         "email": "..."
-       }
-     ]
-   }
-   ```
-
 ---
 
 ## Security Notes
@@ -1341,19 +1278,7 @@ aws lambda get-function-configuration --function-name stenoai-dev-ai
 aws logs tail /aws/lambda/stenoai-dev-ai --follow
 ```
 
-#### 8. WebSocket Connection Fails
-
-**Problem**: Real-time collaboration not working
-
-**Solutions**:
-
-- Verify WebSocket API Gateway is deployed: `bash scripts/ws_create.sh`
-- Check `VITE_WS_BASE_URL` is set correctly
-- Verify JWT token is valid (24-hour expiry)
-- Check WebSocket Lambda has correct permissions
-- Review browser console for WebSocket errors
-
-#### 9. Build Errors
+#### 8. Build Errors
 
 **Problem**: `npm install` or `make` commands fail
 
@@ -1364,7 +1289,7 @@ aws logs tail /aws/lambda/stenoai-dev-ai --follow
 - Verify Python version: `python3 --version` (should be 3.12+)
 - For TypeScript errors: Run `npm run build` in `apps/api` to see detailed errors
 
-#### 10. Environment Variable Issues
+#### 9. Environment Variable Issues
 
 **Problem**: Application can't find required environment variables
 
@@ -1409,9 +1334,9 @@ aws logs tail /aws/lambda/stenoai-dev-ai --follow
 
 ## Future Developments
 
-### Real-time Collaboration Enhancements
+### Real-time Collaboration
 
-The following features are planned to enhance the real-time collaboration experience:
+The following features are planned to enable real-time collaboration:
 
 - **Enhanced Presence System**:
 
