@@ -1,0 +1,1 @@
+wss://n3fxav2xid.execute-api.us-east-1.amazonaws.com/prod

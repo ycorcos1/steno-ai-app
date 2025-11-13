@@ -1,0 +1,11 @@
+{
+  "name": "stenoai-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "web:dev": "npm --prefix apps/web run dev",
+    "web:build": "npm --prefix apps/web run build",
+    "api:build": "npm --prefix apps/api run build"
+  }
+}

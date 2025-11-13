@@ -1,0 +1,39 @@
+{
+  "Rules": [
+    {
+      "ID": "DeleteUploadsAfter30Days",
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 30
+      },
+      "Filter": {}
+    },
+    {
+      "ID": "CleanupDeleteMarkers",
+      "Status": "Enabled",
+      "Expiration": {
+        "ExpiredObjectDeleteMarker": true
+      },
+      "Filter": {}
+    },
+    {
+      "ID": "TransitionNoncurrentToIA",
+      "Status": "Enabled",
+      "NoncurrentVersionTransitions": [
+        {
+          "NoncurrentDays": 30,
+          "StorageClass": "STANDARD_IA"
+        }
+      ],
+      "Filter": {}
+    },
+    {
+      "ID": "DeleteNoncurrentVersions",
+      "Status": "Enabled",
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 60
+      },
+      "Filter": {}
+    }
+  ]
+}
