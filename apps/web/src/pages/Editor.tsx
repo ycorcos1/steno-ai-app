@@ -7,7 +7,7 @@ import {
   useState,
   useRef,
 } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { authApi, useAuth } from "../lib/auth";
 import { initCollabDoc } from "../lib/collab/yjs";
 import * as Y from "yjs";
@@ -74,9 +74,7 @@ const Editor: React.FC = () => {
   const [documentError, setDocumentError] = useState<string | null>(null);
 
   const [draftText, setDraftText] = useState<string>("");
-  const [refinePrompt, setRefinePrompt] = useState<string>(
-    "Tighten the liability section and add bullet points for economic damages."
-  );
+  const [refinePrompt, setRefinePrompt] = useState<string>("");
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
   // Y.js collaboration state
@@ -107,7 +105,11 @@ const Editor: React.FC = () => {
         }));
         setTemplates(fetched);
         if (fetched.length > 0) {
-          setSelectedTemplateId(fetched[0].id);
+          // Find the "Default" template and select it, otherwise select the first template
+          const defaultTemplate = fetched.find(
+            (t) => t.title.toLowerCase() === "default"
+          );
+          setSelectedTemplateId(defaultTemplate?.id || fetched[0].id);
         }
       } catch (err) {
         setTemplatesError(getErrorMessage(err));
@@ -569,28 +571,21 @@ const Editor: React.FC = () => {
       try {
         const response = await authApi.post(`/documents/export/${documentId}`);
 
-        const { downloadUrl, s3Key } = response.data;
+        const { downloadUrl, fileName } = response.data;
 
-        // Extract filename from s3Key (format: exports/<docId>-<timestamp>.docx)
-        const fileName =
-          s3Key?.split("/").pop() || `${document?.title || "export"}.docx`;
+        // Use AI-generated filename, or fallback to document title
+        const downloadFileName =
+          fileName || `${document?.title || "export"}.docx`;
 
         // Trigger download
-        const link = document.createElement("a");
+        const link = window.document.createElement("a");
         link.href = downloadUrl;
-        link.download = fileName;
+        link.download = downloadFileName;
         link.click();
 
         setActionMessage(
           "Export successful! File downloaded. View all exports in the Exports page."
         );
-
-        // Optionally redirect to exports page after a delay
-        setTimeout(() => {
-          if (window.confirm("View all exports?")) {
-            window.location.href = "/exports";
-          }
-        }, 2000);
       } catch (err) {
         setActionMessage(`Export failed: ${getErrorMessage(err)}`);
       }
@@ -732,6 +727,8 @@ const Editor: React.FC = () => {
     display: "flex",
     flexDirection: "column",
     gap: "16px",
+    minWidth: 0, // Allow flex items to shrink below their content size
+    overflow: "hidden" as const, // Prevent content from spilling out
   };
 
   const sectionTitleStyles: CSSProperties = {
@@ -763,7 +760,8 @@ const Editor: React.FC = () => {
     borderRadius: "14px",
     background: "rgba(15, 23, 42, 0.4)",
     padding: "12px",
-    lineHeight: 1.6,
+    lineHeight: 1.4,
+    marginBottom: "8px",
   };
 
   const errorTextStyles: CSSProperties = {
@@ -841,6 +839,7 @@ const Editor: React.FC = () => {
 
   const textareaStyles: CSSProperties = {
     width: "100%",
+    boxSizing: "border-box" as const,
     borderRadius: "14px",
     border: "1px solid rgba(71, 85, 105, 0.5)",
     background: "rgba(15, 23, 42, 0.7)",
@@ -852,6 +851,11 @@ const Editor: React.FC = () => {
     resize: "vertical" as const,
     outline: "none",
     transition: "border-color 0.2s ease, box-shadow 0.2s ease",
+    overflowWrap: "break-word" as const,
+    wordWrap: "break-word" as const,
+    whiteSpace: "pre-wrap" as const,
+    overflowX: "hidden" as const,
+    overflowY: "auto" as const,
   };
 
   const formStyles: CSSProperties = {
@@ -886,23 +890,6 @@ const Editor: React.FC = () => {
               )}
             </div>
             <div style={headerBadgesStyles}>
-              <span style={badgeStyles}>Draft ready</span>
-              <span
-                style={
-                  collabState === "connected"
-                    ? badgeStyles
-                    : collabState === "connecting"
-                    ? badgeConnectingStyles
-                    : badgeOfflineStyles
-                }
-              >
-                {collabState === "connected"
-                  ? `🟢 Live (${activeUsers.size + 1} active)`
-                  : collabState === "connecting"
-                  ? "🟡 Connecting..."
-                  : "⚪ Offline"}
-              </span>
-              <span style={badgeOfflineStyles}>Document ID: {documentId}</span>
               <button
                 onClick={() => navigate("/dashboard")}
                 style={{
@@ -935,18 +922,38 @@ const Editor: React.FC = () => {
               >
                 ← Back to Dashboard
               </button>
-              <Link
-                to={`/documents/${documentId}/history`}
-                style={linkStyles}
+              <button
+                onClick={() => navigate(`/documents/${documentId}/history`)}
+                style={{
+                  borderRadius: "14px",
+                  border: "1px solid rgba(71, 85, 105, 0.5)",
+                  background: "rgba(15, 23, 42, 0.5)",
+                  padding: "6px 12px",
+                  fontSize: "13px",
+                  fontWeight: 500,
+                  color: "rgba(241, 245, 249, 0.9)",
+                  cursor: "pointer",
+                  transition:
+                    "border-color 0.2s ease, color 0.2s ease, background 0.2s ease",
+                  textDecoration: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "4px",
+                }}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.color = "#34d399";
+                  e.currentTarget.style.borderColor =
+                    "rgba(148, 163, 184, 0.6)";
+                  e.currentTarget.style.color = "#f8fafc";
+                  e.currentTarget.style.background = "rgba(15, 23, 42, 0.7)";
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.color = "#6ee7b7";
+                  e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+                  e.currentTarget.style.color = "rgba(241, 245, 249, 0.9)";
+                  e.currentTarget.style.background = "rgba(15, 23, 42, 0.5)";
                 }}
               >
-                View history →
-              </Link>
+                View history
+              </button>
             </div>
           </div>
         </div>
@@ -1020,7 +1027,7 @@ const Editor: React.FC = () => {
                 <div>
                   <h2 style={sectionTitleStyles}>Draft controls</h2>
                   <p style={sectionDescriptionStyles}>
-                    Choose a template to regenerate or refine the draft.
+                    Choose a template to generate a draft.
                   </p>
                 </div>
                 <div style={controlsRowStyles}>
@@ -1062,39 +1069,6 @@ const Editor: React.FC = () => {
                       )}
                     </select>
                   </label>
-                  <label style={labelStyles}>
-                    <span>Custom Prompt</span>
-                    <select
-                      value={selectedGenerationPromptId}
-                      onChange={(event) =>
-                        handleGenerationPromptSelect(event.target.value)
-                      }
-                      disabled={loadingPrompts}
-                      style={{
-                        ...selectStyles,
-                        opacity: loadingPrompts ? 0.5 : 1,
-                        cursor: loadingPrompts ? "not-allowed" : "pointer",
-                      }}
-                      onFocus={(e) => {
-                        e.currentTarget.style.borderColor =
-                          "rgba(16, 185, 129, 0.8)";
-                        e.currentTarget.style.boxShadow =
-                          "0 0 0 3px rgba(16, 185, 129, 0.2)";
-                      }}
-                      onBlur={(e) => {
-                        e.currentTarget.style.borderColor =
-                          "rgba(71, 85, 105, 0.5)";
-                        e.currentTarget.style.boxShadow = "none";
-                      }}
-                    >
-                      <option value="">-- None --</option>
-                      {customPrompts.map((prompt) => (
-                        <option key={prompt.id} value={prompt.id}>
-                          {prompt.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
                 </div>
                 <div style={buttonGroupStyles}>
                   <button
@@ -1113,23 +1087,6 @@ const Editor: React.FC = () => {
                     }}
                   >
                     Generate draft
-                  </button>
-                  <button
-                    type="button"
-                    style={buttonSecondaryStyles}
-                    onClick={() => handleAction("refine")}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.borderColor =
-                        "rgba(16, 185, 129, 0.8)";
-                      e.currentTarget.style.color = "#34d399";
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.borderColor =
-                        "rgba(16, 185, 129, 0.6)";
-                      e.currentTarget.style.color = "rgba(110, 231, 183, 0.9)";
-                    }}
-                  >
-                    Refine
                   </button>
                   <button
                     type="button"
@@ -1209,7 +1166,14 @@ const Editor: React.FC = () => {
                 </div>
               )}
 
-              <div style={{ flex: 1 }}>
+              <div
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  display: "flex",
+                  flexDirection: "column",
+                }}
+              >
                 <label
                   htmlFor="draft"
                   style={{
@@ -1230,11 +1194,13 @@ const Editor: React.FC = () => {
                     setDraftText(event.target.value);
                     // Y.js sync is handled by the input event listener
                   }}
-                  rows={20}
+                  rows={25}
                   style={{
                     ...textareaStyles,
-                    height: "100%",
-                    minHeight: "400px",
+                    flex: 1,
+                    minHeight: "500px",
+                    maxHeight: "none",
+                    maxWidth: "100%",
                   }}
                   onFocus={(e) => {
                     e.currentTarget.style.borderColor =
@@ -1282,48 +1248,6 @@ const Editor: React.FC = () => {
               gap: "12px",
             }}
           >
-            <div>
-              <label
-                htmlFor="refinement-prompt-select"
-                style={{
-                  display: "block",
-                  fontSize: "12px",
-                  fontWeight: 600,
-                  color: "rgba(203, 213, 225, 0.9)",
-                  marginBottom: "4px",
-                }}
-              >
-                Load Custom Prompt
-              </label>
-              <select
-                id="refinement-prompt-select"
-                value={selectedRefinementPromptId}
-                onChange={(e) => handleRefinementPromptSelect(e.target.value)}
-                disabled={loadingPrompts}
-                style={{
-                  ...selectStyles,
-                  width: "100%",
-                  opacity: loadingPrompts ? 0.5 : 1,
-                  cursor: loadingPrompts ? "not-allowed" : "pointer",
-                }}
-                onFocus={(e) => {
-                  e.currentTarget.style.borderColor = "rgba(16, 185, 129, 0.8)";
-                  e.currentTarget.style.boxShadow =
-                    "0 0 0 3px rgba(16, 185, 129, 0.2)";
-                }}
-                onBlur={(e) => {
-                  e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
-                  e.currentTarget.style.boxShadow = "none";
-                }}
-              >
-                <option value="">-- Select a prompt or type your own --</option>
-                {customPrompts.map((prompt) => (
-                  <option key={prompt.id} value={prompt.id}>
-                    {prompt.name}
-                  </option>
-                ))}
-              </select>
-            </div>
             <textarea
               id="refine-prompt"
               value={refinePrompt}

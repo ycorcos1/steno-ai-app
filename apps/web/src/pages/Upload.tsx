@@ -190,6 +190,24 @@ const Upload: React.FC = () => {
     gap: "8px",
   };
 
+  const backButtonStyles: CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "8px 16px",
+    borderRadius: "14px",
+    border: "1px solid rgba(71, 85, 105, 0.5)",
+    background: "rgba(30, 41, 59, 0.4)",
+    color: "rgba(203, 213, 225, 0.9)",
+    fontSize: "14px",
+    fontWeight: 500,
+    textDecoration: "none",
+    cursor: "pointer",
+    transition: "border-color 0.2s ease, background 0.2s ease, color 0.2s ease",
+    marginBottom: "8px",
+    alignSelf: "flex-start",
+  };
+
   const titleStyles: CSSProperties = {
     fontSize: "30px",
     fontWeight: 600,
@@ -242,16 +260,40 @@ const Upload: React.FC = () => {
     gap: "12px",
   };
 
+  const fileInputWrapperStyles: CSSProperties = {
+    position: "relative" as const,
+    display: "inline-block",
+  };
+
   const fileInputStyles: CSSProperties = {
-    width: "100%",
+    position: "absolute" as const,
+    width: "0.1px",
+    height: "0.1px",
+    opacity: 0,
+    overflow: "hidden",
+    zIndex: -1,
+  };
+
+  const fileInputButtonStyles: CSSProperties = {
     borderRadius: "14px",
-    border: "1px solid rgba(71, 85, 105, 0.5)",
-    background: "rgba(15, 23, 42, 0.6)",
-    padding: "8px 12px",
+    border: "1px solid rgba(16, 185, 129, 0.6)",
+    background: "rgba(30, 41, 59, 0.8)",
+    padding: "10px 20px",
     fontSize: "14px",
-    color: "rgba(226, 232, 240, 0.9)",
-    outline: "none",
-    transition: "border-color 0.2s ease, box-shadow 0.2s ease",
+    fontWeight: 600,
+    color: "rgba(110, 231, 183, 0.9)",
+    cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    transition: "border-color 0.2s ease, background 0.2s ease, color 0.2s ease",
+  };
+
+  const fileNameDisplayStyles: CSSProperties = {
+    marginTop: "12px",
+    fontSize: "14px",
+    color: "rgba(203, 213, 225, 0.9)",
+    fontStyle: "italic",
   };
 
   const buttonStyles: CSSProperties = {
@@ -397,6 +439,22 @@ const Upload: React.FC = () => {
     <div style={pageStyles}>
       <header style={headerStyles}>
         <div style={headerContainerStyles}>
+          <button
+            onClick={() => navigate("/dashboard")}
+            style={backButtonStyles}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.7)";
+              e.currentTarget.style.background = "rgba(30, 41, 59, 0.6)";
+              e.currentTarget.style.color = "rgba(203, 213, 225, 1)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+              e.currentTarget.style.background = "rgba(30, 41, 59, 0.4)";
+              e.currentTarget.style.color = "rgba(203, 213, 225, 0.9)";
+            }}
+          >
+            ← Back to Dashboard
+          </button>
           <h1 style={titleStyles}>Upload Document</h1>
           <p style={subtitleStyles}>
             Securely upload client materials to start drafting in the unified
@@ -413,24 +471,39 @@ const Upload: React.FC = () => {
                 Choose file
               </label>
               <div style={inputContainerStyles}>
-                <input
-                  id="document"
-                  type="file"
-                  accept=".pdf,.docx,.doc,.txt"
-                  style={fileInputStyles}
-                  onChange={handleFileChange}
-                  onFocus={(e) => {
-                    e.currentTarget.style.borderColor =
-                      "rgba(16, 185, 129, 0.8)";
-                    e.currentTarget.style.boxShadow =
-                      "0 0 0 3px rgba(16, 185, 129, 0.2)";
-                  }}
-                  onBlur={(e) => {
-                    e.currentTarget.style.borderColor =
-                      "rgba(71, 85, 105, 0.5)";
-                    e.currentTarget.style.boxShadow = "none";
-                  }}
-                />
+                <div style={fileInputWrapperStyles}>
+                  <input
+                    id="document"
+                    type="file"
+                    accept=".pdf,.docx,.doc,.txt"
+                    style={fileInputStyles}
+                    onChange={handleFileChange}
+                  />
+                  <label
+                    htmlFor="document"
+                    style={fileInputButtonStyles}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.borderColor =
+                        "rgba(16, 185, 129, 0.8)";
+                      e.currentTarget.style.background = "rgba(30, 41, 59, 1)";
+                      e.currentTarget.style.color = "#34d399";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.borderColor =
+                        "rgba(16, 185, 129, 0.6)";
+                      e.currentTarget.style.background =
+                        "rgba(30, 41, 59, 0.8)";
+                      e.currentTarget.style.color = "rgba(110, 231, 183, 0.9)";
+                    }}
+                  >
+                    Choose File
+                  </label>
+                </div>
+                {file && (
+                  <p style={fileNameDisplayStyles}>
+                    Selected: {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                  </p>
+                )}
                 <button
                   type="submit"
                   disabled={!file || isSubmitting}

@@ -68,14 +68,14 @@ const Dashboard: React.FC = () => {
         const data = response.data as {
           templates?: Array<{ id: string; title: string; updatedAt: string }>;
         };
-        // Get only the most recent 5 templates
+        // Get only the 2 most recently used templates
         const fetched = (data.templates ?? [])
           .map((t) => ({
             id: t.id,
             title: t.title,
             updatedAt: t.updatedAt,
           }))
-          .slice(0, 5);
+          .slice(0, 2);
         setTemplates(fetched);
       } catch (err) {
         console.error("Failed to fetch templates:", err);
@@ -437,26 +437,6 @@ const Dashboard: React.FC = () => {
                 }}
               >
                 New Template
-              </Link>
-              <Link
-                to="/prompts"
-                style={secondaryButtonStyles}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.transform = "translateY(-2px)";
-                  e.currentTarget.style.borderColor =
-                    "rgba(148, 163, 184, 0.6)";
-                  e.currentTarget.style.boxShadow =
-                    "0 16px 28px -20px rgba(15, 23, 42, 0.75)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = "translateY(0)";
-                  e.currentTarget.style.borderColor =
-                    "rgba(148, 163, 184, 0.35)";
-                  e.currentTarget.style.boxShadow =
-                    "0 14px 24px -18px rgba(15, 23, 42, 0.7)";
-                }}
-              >
-                Custom Prompts
               </Link>
               <Link
                 to="/exports"

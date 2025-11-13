@@ -105,6 +105,20 @@ const footerTextStyles: CSSProperties = {
 const linkStyles: CSSProperties = {
   color: "#34d399",
   fontWeight: 600,
+  textDecoration: "none",
+  transition: "color 0.2s ease",
+};
+
+const backLinkStyles: CSSProperties = {
+  color: "rgba(203, 213, 225, 0.75)",
+  fontSize: "14px",
+  textDecoration: "none",
+  display: "flex",
+  alignItems: "center",
+  gap: "6px",
+  marginBottom: "8px",
+  transition: "color 0.2s ease",
+  cursor: "pointer",
 };
 
 const Signup: React.FC = () => {
@@ -171,6 +185,18 @@ const Signup: React.FC = () => {
   return (
     <div style={backgroundStyles}>
       <div style={cardStyles}>
+        <Link
+          to="/"
+          style={backLinkStyles}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.color = "#34d399";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.color = "rgba(203, 213, 225, 0.75)";
+          }}
+        >
+          ← Back to Home
+        </Link>
         <div>
           <h1 style={titleStyles}>Create your StenoAI account</h1>
           <p style={subtitleStyles}>

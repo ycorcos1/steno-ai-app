@@ -5,9 +5,10 @@ import { authApi } from "../lib/auth";
 
 interface Refinement {
   id: string;
-  prompt: string;
+  prompt: string | null;
   result: string;
   createdAt: string;
+  isOriginal?: boolean;
 }
 
 const getErrorMessage = (error: unknown): string => {
@@ -52,6 +53,8 @@ const History: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [restoringId, setRestoringId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [showRestoreModal, setShowRestoreModal] = useState<boolean>(false);
+  const [pendingRestoreId, setPendingRestoreId] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchRefinements = async () => {
@@ -79,32 +82,44 @@ const History: React.FC = () => {
     void fetchRefinements();
   }, [documentId]);
 
-  const handleRestore = async (refinementId: string) => {
-    if (!documentId) {
+  const handleRestoreClick = (refinementId: string) => {
+    setPendingRestoreId(refinementId);
+    setShowRestoreModal(true);
+  };
+
+  const handleRestoreConfirm = async () => {
+    if (!documentId || !pendingRestoreId) {
       return;
     }
 
-    const confirmed = window.confirm(
-      "This will replace your current draft with this version. Continue?"
-    );
-
-    if (!confirmed) {
-      return;
-    }
+    setShowRestoreModal(false);
+    const refinementId = pendingRestoreId;
+    setPendingRestoreId(null);
 
     try {
       setRestoringId(refinementId);
-      await authApi.post(`/documents/${documentId}/restore`, {
+      console.log(
+        `Restoring refinement ${refinementId} for document ${documentId}`
+      );
+      const response = await authApi.post(`/documents/${documentId}/restore`, {
         refinementId,
       });
+      console.log("Restore response:", response.data);
 
       // Redirect back to editor
       navigate(`/documents/${documentId}`);
     } catch (err) {
-      alert(`Failed to restore: ${getErrorMessage(err)}`);
+      console.error("Restore error:", err);
+      const errorMessage = getErrorMessage(err);
+      alert(`Failed to restore: ${errorMessage}`);
     } finally {
       setRestoringId(null);
     }
+  };
+
+  const handleRestoreCancel = () => {
+    setShowRestoreModal(false);
+    setPendingRestoreId(null);
   };
 
   const toggleExpand = (id: string) => {
@@ -475,7 +490,7 @@ const History: React.FC = () => {
             <div style={timelineListStyles}>
               {refinements.map((refinement, index) => {
                 const isExpanded = expandedIds.has(refinement.id);
-                const isLast = index === refinements.length - 1;
+                const isCurrent = index === 0; // First item is the newest/current version
                 const resultText = isExpanded
                   ? refinement.result
                   : truncateText(refinement.result, 300);
@@ -490,70 +505,102 @@ const History: React.FC = () => {
                         <div style={cardHeaderContentStyles}>
                           <p style={dateStyles}>
                             {formatDate(refinement.createdAt)}
-                            {isLast && (
+                            {isCurrent && (
                               <span style={currentBadgeStyles}>Current</span>
                             )}
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleRestore(refinement.id)}
-                          disabled={restoringId === refinement.id || isLast}
-                          style={
-                            restoringId === refinement.id || isLast
-                              ? restoreButtonDisabledStyles
-                              : restoreButtonStyles
-                          }
-                          onMouseEnter={(e) => {
-                            if (!(restoringId === refinement.id || isLast)) {
-                              e.currentTarget.style.borderColor =
-                                "rgba(16, 185, 129, 0.8)";
-                              e.currentTarget.style.background =
-                                "rgba(16, 185, 129, 0.2)";
+                        {!isCurrent && (
+                          <button
+                            type="button"
+                            onClick={() => handleRestoreClick(refinement.id)}
+                            disabled={restoringId === refinement.id}
+                            style={
+                              restoringId === refinement.id
+                                ? restoreButtonDisabledStyles
+                                : restoreButtonStyles
                             }
-                          }}
-                          onMouseLeave={(e) => {
-                            if (!(restoringId === refinement.id || isLast)) {
-                              e.currentTarget.style.borderColor =
-                                "rgba(16, 185, 129, 0.6)";
-                              e.currentTarget.style.background =
-                                "rgba(16, 185, 129, 0.1)";
-                            }
-                          }}
-                        >
-                          {restoringId === refinement.id
-                            ? "Restoring..."
-                            : "Restore this version"}
-                        </button>
+                            onMouseEnter={(e) => {
+                              if (restoringId !== refinement.id) {
+                                e.currentTarget.style.borderColor =
+                                  "rgba(16, 185, 129, 0.8)";
+                                e.currentTarget.style.background =
+                                  "rgba(16, 185, 129, 0.2)";
+                              }
+                            }}
+                            onMouseLeave={(e) => {
+                              if (restoringId !== refinement.id) {
+                                e.currentTarget.style.borderColor =
+                                  "rgba(16, 185, 129, 0.6)";
+                                e.currentTarget.style.background =
+                                  "rgba(16, 185, 129, 0.1)";
+                              }
+                            }}
+                          >
+                            {restoringId === refinement.id
+                              ? "Restoring..."
+                              : "Restore this version"}
+                          </button>
+                        )}
                       </div>
 
                       <div style={cardContentStyles}>
-                        <div>
-                          <p style={sectionTitleStyles}>Refinement Request</p>
-                          <p style={promptBoxStyles}>{refinement.prompt}</p>
-                        </div>
-
-                        <div>
-                          <p style={sectionTitleStyles}>Refined Draft</p>
-                          <div style={resultBoxStyles}>
-                            <p style={resultTextStyles}>{resultText}</p>
-                            {refinement.result.length > 300 && (
-                              <button
-                                type="button"
-                                onClick={() => toggleExpand(refinement.id)}
-                                style={expandButtonStyles}
-                                onMouseEnter={(e) => {
-                                  e.currentTarget.style.color = "#34d399";
-                                }}
-                                onMouseLeave={(e) => {
-                                  e.currentTarget.style.color = "#6ee7b7";
-                                }}
-                              >
-                                {isExpanded ? "Show less" : "Show more"}
-                              </button>
-                            )}
+                        {refinement.isOriginal ? (
+                          <div>
+                            <p style={sectionTitleStyles}>Original Draft</p>
+                            <div style={resultBoxStyles}>
+                              <p style={resultTextStyles}>{resultText}</p>
+                              {refinement.result.length > 300 && (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleExpand(refinement.id)}
+                                  style={expandButtonStyles}
+                                  onMouseEnter={(e) => {
+                                    e.currentTarget.style.color = "#34d399";
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.currentTarget.style.color = "#6ee7b7";
+                                  }}
+                                >
+                                  {isExpanded ? "Show less" : "Show more"}
+                                </button>
+                              )}
+                            </div>
                           </div>
-                        </div>
+                        ) : (
+                          <>
+                            <div>
+                              <p style={sectionTitleStyles}>
+                                Refinement Request
+                              </p>
+                              <p style={promptBoxStyles}>
+                                {refinement.prompt || "No prompt provided"}
+                              </p>
+                            </div>
+
+                            <div>
+                              <p style={sectionTitleStyles}>Refined Draft</p>
+                              <div style={resultBoxStyles}>
+                                <p style={resultTextStyles}>{resultText}</p>
+                                {refinement.result.length > 300 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleExpand(refinement.id)}
+                                    style={expandButtonStyles}
+                                    onMouseEnter={(e) => {
+                                      e.currentTarget.style.color = "#34d399";
+                                    }}
+                                    onMouseLeave={(e) => {
+                                      e.currentTarget.style.color = "#6ee7b7";
+                                    }}
+                                  >
+                                    {isExpanded ? "Show less" : "Show more"}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -563,6 +610,126 @@ const History: React.FC = () => {
           </div>
         )}
       </main>
+
+      {/* Restore Confirmation Modal */}
+      {showRestoreModal && (
+        <div
+          style={{
+            position: "fixed" as const,
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0, 0, 0, 0.7)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+            backdropFilter: "blur(4px)",
+          }}
+          onClick={handleRestoreCancel}
+        >
+          <div
+            style={{
+              borderRadius: "22px",
+              border: "1px solid rgba(148, 163, 184, 0.18)",
+              background:
+                "linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(17, 24, 39, 0.95))",
+              boxShadow:
+                "0 35px 55px -35px rgba(15, 23, 42, 0.9), 0 20px 30px -25px rgba(15, 23, 42, 0.8)",
+              padding: "32px",
+              maxWidth: "500px",
+              width: "90%",
+              color: "#e2e8f0",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2
+              style={{
+                fontSize: "20px",
+                fontWeight: 600,
+                color: "#f8fafc",
+                marginBottom: "16px",
+                marginTop: 0,
+              }}
+            >
+              Restore Version
+            </h2>
+            <p
+              style={{
+                fontSize: "14px",
+                color: "rgba(203, 213, 225, 0.9)",
+                lineHeight: 1.6,
+                marginBottom: "24px",
+              }}
+            >
+              This will replace your current draft with this version and remove
+              all newer versions. Continue?
+            </p>
+            <div
+              style={{
+                display: "flex",
+                gap: "12px",
+                justifyContent: "flex-end",
+              }}
+            >
+              <button
+                type="button"
+                onClick={handleRestoreCancel}
+                style={{
+                  borderRadius: "14px",
+                  border: "1px solid rgba(71, 85, 105, 0.5)",
+                  background: "rgba(15, 23, 42, 0.6)",
+                  padding: "10px 20px",
+                  fontSize: "14px",
+                  fontWeight: 600,
+                  color: "rgba(203, 213, 225, 0.9)",
+                  cursor: "pointer",
+                  transition: "border-color 0.2s ease, background 0.2s ease",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.7)";
+                  e.currentTarget.style.background = "rgba(15, 23, 42, 0.8)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+                  e.currentTarget.style.background = "rgba(15, 23, 42, 0.6)";
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleRestoreConfirm}
+                style={{
+                  borderRadius: "14px",
+                  background: "linear-gradient(135deg, #10b981, #059669)",
+                  border: "none",
+                  padding: "10px 20px",
+                  fontSize: "14px",
+                  fontWeight: 600,
+                  color: "#052e16",
+                  cursor: "pointer",
+                  boxShadow: "0 18px 30px -20px rgba(16, 185, 129, 0.55)",
+                  transition: "transform 0.2s ease, box-shadow 0.2s ease",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.transform = "translateY(-2px)";
+                  e.currentTarget.style.boxShadow =
+                    "0 22px 35px -22px rgba(16, 185, 129, 0.65)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.transform = "translateY(0)";
+                  e.currentTarget.style.boxShadow =
+                    "0 18px 30px -20px rgba(16, 185, 129, 0.55)";
+                }}
+              >
+                Restore
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

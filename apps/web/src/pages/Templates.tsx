@@ -6,7 +6,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { authApi } from "../lib/auth";
 
 interface Template {
@@ -42,10 +42,14 @@ const getErrorMessage = (error: unknown): string => {
 };
 
 const Templates: React.FC = () => {
+  const navigate = useNavigate();
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [showDeleteModal, setShowDeleteModal] = useState<boolean>(false);
+  const [pendingDeleteTemplate, setPendingDeleteTemplate] =
+    useState<Template | null>(null);
 
   const loadTemplates = useCallback(async () => {
     setLoading(true);
@@ -89,13 +93,19 @@ const Templates: React.FC = () => {
       timeStyle: "short",
     });
 
-  const handleDelete = async (template: Template) => {
-    const confirmed = window.confirm(
-      `Delete "${template.title}"? This cannot be undone.`
-    );
-    if (!confirmed) {
+  const handleDeleteClick = (template: Template) => {
+    setPendingDeleteTemplate(template);
+    setShowDeleteModal(true);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!pendingDeleteTemplate) {
       return;
     }
+
+    const template = pendingDeleteTemplate;
+    setShowDeleteModal(false);
+    setPendingDeleteTemplate(null);
 
     try {
       setDeletingId(template.id);
@@ -106,6 +116,11 @@ const Templates: React.FC = () => {
     } finally {
       setDeletingId(null);
     }
+  };
+
+  const handleDeleteCancel = () => {
+    setShowDeleteModal(false);
+    setPendingDeleteTemplate(null);
   };
 
   const renderTemplateCard = (template: Template, headerColor: string) => {
@@ -225,7 +240,7 @@ const Templates: React.FC = () => {
           {canEdit && (
             <button
               type="button"
-              onClick={() => void handleDelete(template)}
+              onClick={() => handleDeleteClick(template)}
               disabled={deletingId === template.id}
               style={{
                 ...deleteButtonStyles,
@@ -277,6 +292,24 @@ const Templates: React.FC = () => {
     display: "flex",
     flexDirection: "column",
     gap: "16px",
+  };
+
+  const backButtonStyles: CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "8px 16px",
+    borderRadius: "14px",
+    border: "1px solid rgba(71, 85, 105, 0.5)",
+    background: "rgba(30, 41, 59, 0.4)",
+    color: "rgba(203, 213, 225, 0.9)",
+    fontSize: "14px",
+    fontWeight: 500,
+    textDecoration: "none",
+    cursor: "pointer",
+    transition: "border-color 0.2s ease, background 0.2s ease, color 0.2s ease",
+    marginBottom: "8px",
+    alignSelf: "flex-start",
   };
 
   const headerContentStyles: CSSProperties = {
@@ -404,6 +437,22 @@ const Templates: React.FC = () => {
     <div style={pageStyles}>
       <header style={headerStyles}>
         <div style={headerContainerStyles}>
+          <button
+            onClick={() => navigate("/dashboard")}
+            style={backButtonStyles}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.7)";
+              e.currentTarget.style.background = "rgba(30, 41, 59, 0.6)";
+              e.currentTarget.style.color = "rgba(203, 213, 225, 1)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+              e.currentTarget.style.background = "rgba(30, 41, 59, 0.4)";
+              e.currentTarget.style.color = "rgba(203, 213, 225, 0.9)";
+            }}
+          >
+            ← Back to Dashboard
+          </button>
           <div
             style={{ display: "flex", flexDirection: "column", gap: "16px" }}
           >
@@ -544,6 +593,126 @@ const Templates: React.FC = () => {
           </>
         )}
       </main>
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteModal && pendingDeleteTemplate && (
+        <div
+          style={{
+            position: "fixed" as const,
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0, 0, 0, 0.7)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+            backdropFilter: "blur(4px)",
+          }}
+          onClick={handleDeleteCancel}
+        >
+          <div
+            style={{
+              borderRadius: "22px",
+              border: "1px solid rgba(148, 163, 184, 0.18)",
+              background:
+                "linear-gradient(180deg, rgba(17, 24, 39, 0.98), rgba(17, 24, 39, 0.95))",
+              boxShadow:
+                "0 35px 55px -35px rgba(15, 23, 42, 0.9), 0 20px 30px -25px rgba(15, 23, 42, 0.8)",
+              padding: "32px",
+              maxWidth: "500px",
+              width: "90%",
+              color: "#e2e8f0",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2
+              style={{
+                fontSize: "20px",
+                fontWeight: 600,
+                color: "#f8fafc",
+                marginBottom: "16px",
+                marginTop: 0,
+              }}
+            >
+              Delete Template
+            </h2>
+            <p
+              style={{
+                fontSize: "14px",
+                color: "rgba(203, 213, 225, 0.9)",
+                lineHeight: 1.6,
+                marginBottom: "24px",
+              }}
+            >
+              Delete &quot;{pendingDeleteTemplate.title}&quot;? This cannot be
+              undone.
+            </p>
+            <div
+              style={{
+                display: "flex",
+                gap: "12px",
+                justifyContent: "flex-end",
+              }}
+            >
+              <button
+                type="button"
+                onClick={handleDeleteCancel}
+                style={{
+                  borderRadius: "14px",
+                  border: "1px solid rgba(71, 85, 105, 0.5)",
+                  background: "rgba(15, 23, 42, 0.6)",
+                  padding: "10px 20px",
+                  fontSize: "14px",
+                  fontWeight: 600,
+                  color: "rgba(203, 213, 225, 0.9)",
+                  cursor: "pointer",
+                  transition: "border-color 0.2s ease, background 0.2s ease",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.7)";
+                  e.currentTarget.style.background = "rgba(15, 23, 42, 0.8)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+                  e.currentTarget.style.background = "rgba(15, 23, 42, 0.6)";
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteConfirm}
+                style={{
+                  borderRadius: "14px",
+                  border: "1px solid rgba(239, 68, 68, 0.6)",
+                  background: "rgba(127, 29, 29, 0.6)",
+                  padding: "10px 20px",
+                  fontSize: "14px",
+                  fontWeight: 600,
+                  color: "rgba(254, 226, 226, 0.9)",
+                  cursor: "pointer",
+                  transition:
+                    "border-color 0.2s ease, background 0.2s ease, color 0.2s ease",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.8)";
+                  e.currentTarget.style.background = "rgba(127, 29, 29, 0.8)";
+                  e.currentTarget.style.color = "rgba(254, 226, 226, 1)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.6)";
+                  e.currentTarget.style.background = "rgba(127, 29, 29, 0.6)";
+                  e.currentTarget.style.color = "rgba(254, 226, 226, 0.9)";
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -10,6 +10,7 @@ interface TemplateRow {
   owner_id: string | null;
   created_at: string;
   updated_at: string;
+  last_used_at: string | null;
 }
 
 interface TemplateResponse {
@@ -72,10 +73,13 @@ router.get("/", async (req: Request, res: Response) => {
   try {
     const result = await query(
       `
-        SELECT id, title, content, is_global, owner_id, created_at, updated_at
+        SELECT id, title, content, is_global, owner_id, created_at, updated_at, last_used_at
         FROM templates
         WHERE owner_id = $1 OR is_global = true
-        ORDER BY is_global DESC, updated_at DESC
+        ORDER BY 
+          CASE WHEN last_used_at IS NOT NULL THEN 0 ELSE 1 END,
+          last_used_at DESC NULLS LAST,
+          updated_at DESC
       `,
       [userId]
     );

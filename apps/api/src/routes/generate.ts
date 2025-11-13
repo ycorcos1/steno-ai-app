@@ -83,6 +83,14 @@ router.post(
       const template = templateResult.rows[0];
       const templateContent = template.content || "";
 
+      // Update template's last_used_at timestamp
+      await query(`UPDATE templates SET last_used_at = NOW() WHERE id = $1`, [
+        templateId,
+      ]).catch((err) => {
+        // Log but don't fail if update fails (column might not exist yet)
+        console.warn("Failed to update template last_used_at:", err);
+      });
+
       // Check if document has chunks
       const chunksResult = await query(
         `SELECT idx, start, "end", summary

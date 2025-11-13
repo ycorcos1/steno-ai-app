@@ -211,21 +211,21 @@ router.get(
       }
 
       // Verify document access (owner or collaborator)
-      const docResult = await query(
+      const accessCheckResult = await query(
         `SELECT id, owner_id
          FROM documents
          WHERE id = $1`,
         [documentId]
       );
 
-      if (docResult.rows.length === 0) {
+      if (accessCheckResult.rows.length === 0) {
         return res.status(404).json({ error: "Document not found" });
       }
 
-      const document = docResult.rows[0];
+      const accessDocument = accessCheckResult.rows[0];
 
       // Check if user is owner or collaborator
-      if (document.owner_id !== userId) {
+      if (accessDocument.owner_id !== userId) {
         // Check if user is a collaborator
         const collabResult = await query(
           `SELECT id
@@ -241,6 +241,18 @@ router.get(
           });
         }
       }
+
+      // Fetch document to get original draft
+      const docDraftResult = await query(
+        `SELECT draft_text, status, updated_at
+         FROM documents
+         WHERE id = $1`,
+        [documentId]
+      );
+
+      const docDraft = docDraftResult.rows[0];
+      const originalDraft = docDraft?.draft_text;
+      const originalDraftDate = docDraft?.updated_at;
 
       // Fetch refinements
       const refinementsResult = await query(
@@ -258,7 +270,45 @@ router.get(
         createdAt: row.created_at.toISOString(),
       }));
 
-      res.json({ refinements });
+      // Include original draft if it exists and document has been generated
+      const history: Array<{
+        id: string;
+        prompt: string | null;
+        result: string;
+        createdAt: string;
+        isOriginal: boolean;
+      }> = [];
+
+      // Add refinements first (newest to oldest)
+      refinements.forEach((refinement) => {
+        history.push({
+          ...refinement,
+          isOriginal: false,
+        });
+      });
+
+      // Add original draft at the end (oldest) if it exists
+      if (
+        originalDraft &&
+        originalDraft.trim().length > 0 &&
+        docDraft?.status === "draft_generated"
+      ) {
+        history.push({
+          id: "original",
+          prompt: null,
+          result: originalDraft,
+          createdAt: originalDraftDate.toISOString(),
+          isOriginal: true,
+        });
+      }
+
+      // Sort by date descending (newest first) for display
+      history.sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+
+      res.json({ refinements: history });
     } catch (error: any) {
       console.error("Error fetching refinements:", error);
       res.status(500).json({
@@ -277,6 +327,7 @@ router.get(
 router.post(
   "/:id/restore",
   authenticateToken,
+  idempotencyMiddleware,
   async (req: Request, res: Response) => {
     try {
       const { id: documentId } = req.params;
@@ -306,9 +357,49 @@ router.post(
         return res.status(404).json({ error: "Document not found" });
       }
 
+      // Handle restoring to original draft
+      if (refinementId === "original") {
+        const originalDocResult = await query(
+          `SELECT draft_text, updated_at FROM documents WHERE id = $1 AND owner_id = $2`,
+          [documentId, userId]
+        );
+
+        if (originalDocResult.rows.length === 0) {
+          return res.status(404).json({ error: "Document not found" });
+        }
+
+        const originalDraftText = originalDocResult.rows[0].draft_text;
+        const originalUpdatedAt = originalDocResult.rows[0].updated_at;
+
+        if (!originalDraftText || originalDraftText.trim().length === 0) {
+          return res.status(400).json({
+            error: "Original draft not found or is empty",
+          });
+        }
+
+        // Delete all refinements (they all came after the original)
+        await query(`DELETE FROM refinements WHERE document_id = $1`, [
+          documentId,
+        ]);
+
+        // Update document with original draft
+        await query(
+          `UPDATE documents
+               SET draft_text = $1, updated_at = NOW()
+               WHERE id = $2`,
+          [originalDraftText, documentId]
+        );
+
+        res.json({
+          success: true,
+          draftText: originalDraftText,
+        });
+        return;
+      }
+
       // Fetch refinement and verify it belongs to this document
       const refinementResult = await query(
-        `SELECT id, result
+        `SELECT id, result, created_at
          FROM refinements
          WHERE id = $1 AND document_id = $2`,
         [refinementId, documentId]
@@ -322,6 +413,14 @@ router.post(
 
       const refinement = refinementResult.rows[0];
       const restoredText = refinement.result;
+      const restoredCreatedAt = refinement.created_at;
+
+      // Delete all refinements created AFTER this one (newer versions)
+      await query(
+        `DELETE FROM refinements
+         WHERE document_id = $1 AND created_at > $2`,
+        [documentId, restoredCreatedAt]
+      );
 
       // Update document with restored draft
       await query(
