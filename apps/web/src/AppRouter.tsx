@@ -13,6 +13,8 @@ import Templates from "./pages/Templates";
 import Upload from "./pages/Upload";
 import Exports from "./pages/Exports";
 import Prompts from "./pages/Prompts";
+import Invitations from "./pages/Invitations";
+import InvitationAccept from "./pages/InvitationAccept";
 
 const LoadingScreen: React.FC = () => (
   <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
@@ -149,6 +151,15 @@ const AppRouter: React.FC = () => (
           </ProtectedRoute>
         }
       />
+      <Route
+        path="/invitations"
+        element={
+          <ProtectedRoute>
+            <Invitations />
+          </ProtectedRoute>
+        }
+      />
+      <Route path="/invitations/accept/:token" element={<InvitationAccept />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   </BrowserRouter>

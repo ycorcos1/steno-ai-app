@@ -17,7 +17,7 @@ import {
 } from "@aws-sdk/client-lambda";
 
 const router = express.Router();
-router.use(express.json());
+router.use(express.json({ limit: '10mb' }));
 
 const s3Client = new S3Client({
   region: process.env.REGION || "us-east-1",

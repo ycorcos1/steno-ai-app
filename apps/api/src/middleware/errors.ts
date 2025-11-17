@@ -83,6 +83,14 @@ function mapErrorToResponse(error: any): {
   code: string;
   message: string;
 } {
+  // Handle Express body parser payload size errors
+  if (error.name === "PayloadTooLargeError" || error.type === "entity.too.large") {
+    return {
+      statusCode: 413,
+      code: "PAYLOAD_TOO_LARGE",
+      message: "Request payload is too large. Maximum size is 10MB.",
+    };
+  }
   // Custom error classes
   if (error instanceof ValidationError) {
     return {

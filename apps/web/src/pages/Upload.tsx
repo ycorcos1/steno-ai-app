@@ -11,10 +11,9 @@ import { authApi } from "../lib/auth";
 
 type UploadPhase =
   | "idle"
-  | "requesting"
   | "uploading"
-  | "ingesting"
-  | "completed";
+  | "extracting"
+  | "ready";
 
 interface Step {
   label: string;
@@ -29,23 +28,18 @@ const steps: Step[] = [
     description: "Choose a PDF, DOCX, or TXT file from your device.",
   },
   {
-    key: "requesting",
-    label: "Create Upload Slot",
-    description: "Securely reserving space in S3.",
-  },
-  {
     key: "uploading",
-    label: "Upload to S3",
+    label: "Uploading File",
     description: "Sending the file to encrypted storage.",
   },
   {
-    key: "ingesting",
-    label: "Process & Extract Text",
+    key: "extracting",
+    label: "Extracting File",
     description: "Extracting text and preparing document workspace.",
   },
   {
-    key: "completed",
-    label: "Ready in Editor",
+    key: "ready",
+    label: "Ready",
     description: "Redirecting you to the document editor.",
   },
 ];
@@ -116,7 +110,7 @@ const Upload: React.FC = () => {
     try {
       setIsSubmitting(true);
       setError(null);
-      setPhase("requesting");
+      setPhase("uploading");
 
       const uploadUrlResponse = await authApi.post("/documents/upload-url", {
         contentType,
@@ -127,8 +121,6 @@ const Upload: React.FC = () => {
         uploadUrl: string;
         key: string;
       };
-
-      setPhase("uploading");
 
       const uploadResult = await fetch(uploadUrl, {
         method: "PUT",
@@ -144,7 +136,7 @@ const Upload: React.FC = () => {
         );
       }
 
-      setPhase("ingesting");
+      setPhase("extracting");
 
       const ingestResponse = await authApi.post("/documents/ingest", {
         key,
@@ -155,7 +147,7 @@ const Upload: React.FC = () => {
 
       const { documentId } = ingestResponse.data as { documentId: string };
 
-      setPhase("completed");
+      setPhase("ready");
       navigate(`/documents/${documentId}`, { replace: true });
     } catch (err) {
       console.error("Upload flow failed:", err);

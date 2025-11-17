@@ -25,19 +25,34 @@
 |  Express handlers      <------> | FastAPI: /generate   |
 |  S3 presign, RDS, etc.|  VPC    | Bedrock invokeModel  |
 +----+------------------+        +----------------------+
-     |        |     |                         |
-     |        |     |                         |
-     |   +----v-+  +v-----+             +---- v ----+
-     |   |  S3  |  |RDS   |             | Bedrock   |
-     |   |(uploads, exports)            | (Claude)  |
-     |   +------+  +------+             +-----------+
+     |        |     |     |                 |
+     |        |     |     |                 |
+     |   +----v-+  +v-----+  +v--------+   +---- v ----+
+     |   |  S3  |  |RDS   |  |DynamoDB |   | Bedrock   |
+     |   |(uploads, exports) |(connections) | (Claude)  |
+     |   +------+  +------+  +---------+  +-----------+
      |      ^
      |      | WebSocket (collab)
      v      |
 +----+------v-------------------+
 | API Gateway - WebSocket API   |
 | Routes: $connect/$default/... |
-+--------------------------------
++----+--------------------------+
+     |
+     | AWS_PROXY
+     v
++----+------------------+
+| Lambda (Node / WS)    |
+| WebSocket relay       |
+| Connection tracking   |
++----+------------------+
+     |        |
+     |        |
+     v        v
++----+    +---------+
+|RDS  |    |DynamoDB |
+|(Y.js ops)|(connections)|
++----+    +---------+
 ```
 
 **Key principles**
@@ -46,9 +61,10 @@
 - Public REST via **API Gateway (HTTP)** proxying to **Node Lambda**.
 - AI microservice via **Python Lambda** calling **Amazon Bedrock**.
 - Real‑time collab via **API Gateway (WebSocket)** + Node Lambda relay.
-- **RDS (PostgreSQL)** stores users, templates, documents, revisions, collab state.
+- **RDS (PostgreSQL)** stores users, templates, documents, revisions, Y.js snapshots/operations.
+- **DynamoDB** stores WebSocket connection state for real-time collaboration (low-latency, high-throughput).
 - **S3** stores raw uploads and exports. Presigned URLs for client up/download.
-- All compute in **private VPC** subnets with **VPC Endpoints** (S3, Bedrock, Secrets).
+- All compute in **private VPC** subnets with **VPC Endpoints** (S3, Bedrock, Secrets, DynamoDB).
 - Secrets in **AWS Secrets Manager**.
 
 ---
@@ -94,15 +110,21 @@
 
 - API Gateway (WebSocket) routes: `$connect`, `$disconnect`, `$default`.
 - Node Lambda relay publishes ops between connected clients in a document room.
+- **Connection State Management:**
+  - **DynamoDB** (`stenoai-<env>-connections`): Stores WebSocket connection metadata
+    - Partition key: `connectionId`
+    - Global Secondary Indexes: `userId-index`, `documentId-index`
+    - TTL: 1 hour expiration for automatic cleanup
+    - Attributes: `userId`, `documentId`, `endpoint`, `connectedAt`, `lastActivityAt`
 - **Connection Protocol:**
-  - `$connect`: Client sends JWT in query param `?token=<jwt>`. Server validates and stores `connectionId → userId` mapping.
-  - Join room: First message after connect: `{ "action": "join", "documentId": "uuid" }`. Server validates user access and adds to room.
-  - Broadcast updates: `{ "action": "update", "documentId": "uuid", "update": "<base64-yjs-update>" }`. Relayed to all peers in room.
-  - `$disconnect`: Cleanup connection mapping and notify room peers.
-- Persistence layer:
+  - `$connect`: Client sends JWT in query param `?token=<jwt>`. Server validates and stores `connectionId → userId` mapping in DynamoDB.
+  - Join room: First message after connect: `{ "action": "join", "documentId": "uuid" }`. Server validates user access, updates DynamoDB with `documentId`, and adds to room.
+  - Broadcast updates: `{ "action": "update", "documentId": "uuid", "update": "<base64-yjs-update>" }`. Server queries DynamoDB for all connections in room, then relays to all peers.
+  - `$disconnect`: Cleanup connection from DynamoDB and notify room peers via presence broadcast.
+- **Persistence layer (RDS):**
   - `doc_snapshots` (periodic Y.js encoded state, every ~100 ops or 5 min).
   - `doc_ops` (append‑only op log with timestamps, session id).
-- Reconnect flow: on `$connect` + join, server loads latest snapshot + plays ops since checkpoint.
+- **Reconnect flow**: on `$connect` + join, server loads latest snapshot + plays ops since checkpoint from RDS, then queries DynamoDB for active connections in room.
 
 ---
 
@@ -113,15 +135,29 @@
 - **VPC** with 2 private subnets (across AZs). Security groups:
   - `sg-lambda`: allows egress to VPC endpoints; ingress none.
   - `sg-rds`: allows ingress on 5432 from `sg-lambda` only.
-- **VPC Endpoints (Interface):** `com.amazonaws.<region>.bedrock-runtime`, `secretsmanager`.
-- **VPC Endpoint (Gateway):** S3.
-- No NAT Gateway required.
+- **VPC Endpoints (Interface):**
+  - `com.amazonaws.<region>.bedrock-runtime` — AI service access
+  - `com.amazonaws.<region>.secretsmanager` — Secrets Manager access
+  - `com.amazonaws.<region>.dynamodb` — DynamoDB access for WebSocket connection state
+- **VPC Endpoint (Gateway):** S3 — for uploads and exports
+- **NAT Gateway**: Required for WebSocket Lambda to reach API Gateway Management API (for sending messages to clients)
+- **Route Tables**:
+  - Public subnets route through Internet Gateway
+  - Private subnets route through NAT Gateway for outbound internet access
 
 ### 3.2 Compute
 
 - **Lambda/API (Node 20.x)** — attached to VPC private subnets.
+  - Handles REST API routes (Express.js)
+  - Memory: 256MB, Timeout: 30s
 - **Lambda/AI (Python 3.12)** — attached to same VPC.
-- Memory/timeout tuned: API (256MB/15s), AI (1024MB/60s).
+  - Handles AI generation requests (FastAPI)
+  - Memory: 1024MB, Timeout: 60s
+- **Lambda/WebSocket (Node 20.x)** — attached to VPC private subnets.
+  - Handles WebSocket connections for real-time collaboration
+  - Routes: `$connect`, `$disconnect`, `$default`
+  - Memory: 512MB, Timeout: 30s
+  - Requires NAT Gateway access for API Gateway Management API
 
 ### 3.3 Storage & CDN
 
@@ -140,8 +176,28 @@
 - **RDS PostgreSQL** (db.t4g.micro for dev), in private subnets.
 - Parameter group with UTF‑8; storage autoscaling on.
 - **Connection Management**: Lambda uses `pg-pool` with `max: 2` connections per instance to avoid exhausting RDS connections. Consider RDS Proxy for production high-concurrency scenarios.
+- **Schema**: Stores users, templates, documents, refinements, Y.js snapshots (`doc_snapshots`), Y.js operations (`doc_ops`), document collaborators, invitations.
 
-### 3.5 Secrets & Config
+### 3.5 DynamoDB
+
+- **Table**: `stenoai-<env>-connections`
+  - **Purpose**: WebSocket connection state for real-time collaboration
+  - **Partition Key**: `connectionId` (string)
+  - **Global Secondary Indexes**:
+    - `userId-index`: Query connections by user ID
+    - `documentId-index`: Query connections by document ID (for room broadcasting)
+  - **TTL**: Enabled on `ttl` attribute (1 hour expiration for automatic cleanup)
+  - **Attributes**: `userId`, `documentId`, `endpoint`, `connectedAt`, `lastActivityAt`
+  - **Billing**: On-demand (pay per request)
+  - **Access**: Lambda functions access via VPC Interface Endpoint for DynamoDB
+- **Why DynamoDB for Connections?**
+  - **Low Latency**: < 10ms read/write latency required for real-time collaboration
+  - **High Throughput**: Handles thousands of concurrent WebSocket connections
+  - **Stateless Lambda**: No in-memory state needed - all connection data in DynamoDB
+  - **Automatic Scaling**: On-demand billing scales automatically with traffic
+  - **TTL Support**: Automatic cleanup of stale connections
+
+### 3.6 Secrets & Config
 
 - **AWS Secrets Manager**
   - `/stenoai/<env>/db` — `PGHOST`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`.
@@ -156,16 +212,21 @@
 ## 4) Security Model
 
 - All data in transit via HTTPS (CloudFront ↔ Browser, Browser ↔ API GW).
-- Private data paths stay inside VPC via endpoints (S3, Bedrock, Secrets).
+- Private data paths stay inside VPC via endpoints (S3, Bedrock, Secrets, DynamoDB).
 - IAM policies:
   - API Lambda: `s3:GetObject/PutObject` on uploads/exports; `secretsmanager:GetSecretValue` on `/stenoai/*`.
   - AI Lambda: `bedrock:InvokeModel` on selected model; `secretsmanager:GetSecretValue`.
+  - WebSocket Lambda: `dynamodb:PutItem/GetItem/UpdateItem/DeleteItem/Query` on `stenoai-<env>-connections`; `execute-api:ManageConnections` on WebSocket API; `secretsmanager:GetSecretValue` on `/stenoai/*`.
   - RDS access via SG allow‑list only.
+  - DynamoDB access via VPC Interface Endpoint (private connectivity).
 - JWT auth on all private routes; presigned URLs scoped and expiring (≤15 min).
+- WebSocket connections require JWT token validation on `$connect`.
 
 ---
 
-## 5) Data Model (RDS)
+## 5) Data Model
+
+### 5.1 RDS (PostgreSQL)
 
 ```
 users(id pk, email unique, password_hash, created_at)
@@ -179,7 +240,27 @@ doc_ops(id pk, document_id fk, op_bytes, created_at, session_id)
 user_prompts(id pk, owner_id fk, name, body, created_at)
 document_collaborators(id pk, document_id fk, user_id fk, role varchar, added_at)
   -- role: 'owner' | 'editor' | 'viewer'
+invitations(id pk, document_id fk, inviter_id fk, token unique, email, role varchar, status varchar, expires_at, created_at)
+  -- role: 'editor' | 'viewer'
+  -- status: 'pending' | 'accepted' | 'declined' | 'expired'
 exports(id pk, document_id fk, s3_key varchar, created_at, expires_at)
+```
+
+### 5.2 DynamoDB
+
+```
+stenoai-<env>-connections
+  Partition Key: connectionId (string)
+  Attributes:
+    - userId (string) — User ID who owns this connection
+    - documentId (string, nullable) — Document ID if joined to a room
+    - endpoint (string) — API Gateway Management API endpoint URL
+    - connectedAt (number) — Timestamp when connection was established
+    - lastActivityAt (number) — Timestamp of last activity (ping/update)
+    - ttl (number) — TTL timestamp for automatic expiration (1 hour)
+  Global Secondary Indexes:
+    - userId-index: Partition key = userId
+    - documentId-index: Partition key = documentId
 ```
 
 ---
@@ -211,14 +292,14 @@ exports(id pk, document_id fk, s3_key varchar, created_at, expires_at)
 ### 6.4 Collaborative Edit
 
 1. Clients connect to WebSocket `wss://<ws-id>.execute-api.<region>.amazonaws.com/prod?token=<jwt>`.
-2. Server validates JWT on `$connect` and stores `connectionId → userId`.
+2. Server validates JWT on `$connect` and stores `connectionId → userId` mapping in **DynamoDB** (`stenoai-<env>-connections`).
 3. Client sends join message: `{ "action": "join", "documentId": "<uuid>" }`.
-4. Server checks `document_collaborators` table for access; if authorized, adds connection to room.
-5. Server sends latest `doc_snapshot` + all `doc_ops` since that snapshot to sync client.
+4. Server checks `document_collaborators` table (RDS) for access; if authorized, updates DynamoDB connection record with `documentId`.
+5. Server queries RDS for latest `doc_snapshot` + all `doc_ops` since that snapshot, then sends to client for sync.
 6. Editor uses Y.js; local ops broadcast via `$default` as `{ "action": "update", "documentId": "<uuid>", "update": "<base64>" }`.
-7. Relay Lambda fans out to all peers in room.
-8. Server persists ops to `doc_ops` and creates new snapshot every ~100 ops or 5 minutes.
-9. On `$disconnect`, server removes connection from room and notifies peers (presence update).
+7. Server queries **DynamoDB** `documentId-index` GSI to find all connections in room, then uses API Gateway Management API to relay update to all peers.
+8. Server persists ops to RDS `doc_ops` table and creates new snapshot every ~100 ops or 5 minutes.
+9. On `$disconnect`, server deletes connection from **DynamoDB** and notifies remaining peers via presence broadcast.
 
 ### 6.5 Export
 

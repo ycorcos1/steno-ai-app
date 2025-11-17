@@ -103,7 +103,7 @@ fi
 # Step 6: Create or update Lambda function
 echo ""
 echo "⚡ Step 4: Creating/updating Lambda function..."
-ENV_VARS="ENV=$ENV,REGION=$REGION,APP=$APP,SECRETS_PATH=/stenoai/${ENV}/app"
+ENV_VARS="ENV=$ENV,REGION=$REGION,APP=$APP"
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" &>/dev/null; then
     echo "  Function exists, updating code..."

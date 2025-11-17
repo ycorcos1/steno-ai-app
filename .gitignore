@@ -48,3 +48,6 @@ yarn-error.log*
 *.temp
 .cache/
 .npm-cache/
+
+# Interview materials
+docs/INTERVIEW_DEMO_GUIDE.md

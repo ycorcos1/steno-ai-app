@@ -12,6 +12,7 @@
         "bedrock:*",
         "ec2:*",
         "rds:*",
+        "dynamodb:*",
         "secretsmanager:*",
         "logs:*",
         "cloudwatch:*",

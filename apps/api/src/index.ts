@@ -13,9 +13,15 @@ import exportRouter from "./routes/export";
 import { query } from "./db/pg";
 import { errorHandler } from "./middleware/errors";
 import { idempotencyMiddleware } from "./middleware/idempotency";
+import presenceRouter from "./routes/presence";
+import {
+  documentsRouter as collaboratorsDocumentsRouter,
+  invitationsRouter,
+} from "./routes/collaborators";
 
 const app = express();
-app.use(express.json());
+// Increase body size limit to 10MB for large documents
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
 // Handle CORS preflight OPTIONS requests
@@ -135,6 +141,16 @@ app.use("/ai", refineRouter);
 app.use("/:stage/ai", refineRouter);
 app.use("/documents", refineRouter);
 app.use("/:stage/documents", refineRouter);
+
+// Presence routes - register before export routes to ensure correct matching
+app.use("/documents", presenceRouter);
+app.use("/:stage/documents", presenceRouter);
+
+// Collaboration invitation & collaborator management routes
+app.use("/documents", collaboratorsDocumentsRouter);
+app.use("/:stage/documents", collaboratorsDocumentsRouter);
+app.use("/invitations", invitationsRouter);
+app.use("/:stage/invitations", invitationsRouter);
 
 // Export routes - handle both with and without stage prefix
 // Apply idempotency middleware to POST routes

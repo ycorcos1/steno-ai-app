@@ -1,9 +1,10 @@
 import express, { Request, Response } from "express";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
-import { query } from "../db/pg";
+import { query, checkDocumentAccess } from "../db/pg";
 import { idempotencyMiddleware } from "../middleware/idempotency";
 import { retry } from "../lib/retry";
+import { cleanAiResponse } from "../lib/cleanAiResponse";
 import {
   LambdaClient,
   InvokeCommand,
@@ -11,7 +12,7 @@ import {
 } from "@aws-sdk/client-lambda";
 
 const router = express.Router();
-router.use(express.json());
+router.use(express.json({ limit: '10mb' }));
 
 /**
  * POST /ai/refine
@@ -51,12 +52,22 @@ router.post(
         },
       });
 
-      // Fetch document and verify ownership
+      // Check if user has access (owner or editor - viewers cannot refine)
+      const access = await checkDocumentAccess(documentId, userId);
+      if (!access || access === "viewer") {
+        return res.status(403).json({ 
+          error: access === "viewer" 
+            ? "Viewers cannot refine documents" 
+            : "Document not found" 
+        });
+      }
+
+      // Fetch document (owner or editor can proceed)
       const docResult = await query(
         `SELECT id, owner_id, draft_text, status
          FROM documents
-         WHERE id = $1 AND owner_id = $2`,
-        [documentId, userId]
+         WHERE id = $1`,
+        [documentId]
       );
 
       if (docResult.rows.length === 0) {
@@ -82,7 +93,9 @@ ${currentDraft}
 **User's Refinement Request:**
 ${prompt}
 
-Generate the refined version of the draft that incorporates the user's requested changes while maintaining coherence and professional quality.`;
+Generate the refined version of the draft that incorporates the user's requested changes while maintaining coherence and professional quality.
+
+IMPORTANT: Return ONLY the refined draft text. Do not include any introductory text, explanations, meta-commentary, or phrases like "Here's the refined version" or "Here is the refined version". Start directly with the refined content.`;
 
       // Call AI Lambda directly with retry logic
       const aiResponse = await retry(
@@ -157,7 +170,10 @@ Generate the refined version of the draft that incorporates the user's requested
         { maxAttempts: 5, initialDelayMs: 100 }
       );
 
-      const refinedText = aiResponse.data.text || "";
+      let refinedText = aiResponse.data.text || "";
+
+      // Clean the response to remove any unwanted prefix text
+      refinedText = cleanAiResponse(refinedText);
 
       // Store refinement in database
       const refinementResult = await query(
@@ -345,12 +361,22 @@ router.post(
         return res.status(401).json({ error: "User not authenticated" });
       }
 
-      // Verify document ownership
+      // Check if user has access (owner or editor - viewers cannot restore)
+      const access = await checkDocumentAccess(documentId, userId);
+      if (!access || access === "viewer") {
+        return res.status(403).json({ 
+          error: access === "viewer" 
+            ? "Viewers cannot restore document versions" 
+            : "Document not found" 
+        });
+      }
+
+      // Fetch document (owner or editor can proceed)
       const docResult = await query(
         `SELECT id, owner_id
          FROM documents
-         WHERE id = $1 AND owner_id = $2`,
-        [documentId, userId]
+         WHERE id = $1`,
+        [documentId]
       );
 
       if (docResult.rows.length === 0) {
@@ -360,8 +386,8 @@ router.post(
       // Handle restoring to original draft
       if (refinementId === "original") {
         const originalDocResult = await query(
-          `SELECT draft_text, updated_at FROM documents WHERE id = $1 AND owner_id = $2`,
-          [documentId, userId]
+          `SELECT draft_text, updated_at FROM documents WHERE id = $1`,
+          [documentId]
         );
 
         if (originalDocResult.rows.length === 0) {

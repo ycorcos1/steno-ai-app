@@ -2,6 +2,7 @@ import axios from "axios";
 import {
   CSSProperties,
   FormEvent,
+  useCallback,
   useEffect,
   useMemo,
   useState,
@@ -9,8 +10,18 @@ import {
 } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { authApi, useAuth } from "../lib/auth";
-import { initCollabDoc } from "../lib/collab/yjs";
+import { ApiGatewayWebSocketProvider, initCollabDoc } from "../lib/collab/yjs";
 import * as Y from "yjs";
+import {
+  ActiveUsersSidebar,
+  ActiveUser,
+} from "../components/ActiveUsersSidebar";
+import { ConnectionStatusBadge } from "../components/ConnectionStatusBadge";
+import { ToastContainer, ToastVariant } from "../components/Toast";
+import { SyncStatusIndicator } from "../components/SyncStatusIndicator";
+import { CollaborationErrorBoundary } from "../components/CollaborationErrorBoundary";
+import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import { ShareModal } from "../components/ShareModal";
 
 interface TemplateOption {
   id: string;
@@ -39,6 +50,16 @@ const getErrorMessage = (error: unknown): string => {
 
   return "Something went wrong";
 };
+
+const COLLAB_TOAST_KEYS = {
+  CONNECTED: "collab-connected",
+  RECONNECTING: "collab-reconnecting",
+  CONNECTION_ERROR: "collab-connection-error",
+  ACCESS_DENIED: "collab-access-denied",
+  AI_OPERATION: "collab-ai-operation",
+  COLLABORATOR_PRESENT: "collab-presence",
+  ERROR_BOUNDARY: "collab-error-boundary",
+} as const;
 
 const Editor: React.FC = () => {
   const { id: documentId = "draft" } = useParams<{ id: string }>();
@@ -77,17 +98,102 @@ const Editor: React.FC = () => {
   const [refinePrompt, setRefinePrompt] = useState<string>("");
   const [actionMessage, setActionMessage] = useState<string | null>(null);
 
+  // Responsive layout state
+  const [windowWidth, setWindowWidth] = useState<number>(window.innerWidth);
+
+  // Track if we're applying a remote update to avoid conflicts
+  const isApplyingRemoteUpdateRef = useRef<boolean>(false);
+  const typingTimeoutRef = useRef<number | null>(null);
+
   // Y.js collaboration state
   const [collabState, setCollabState] = useState<
-    "connecting" | "connected" | "disconnected" | "error"
+    | "connecting"
+    | "connected"
+    | "disconnected"
+    | "reconnecting"
+    | "failed"
+    | "error"
   >("disconnected");
-  const [activeUsers, setActiveUsers] = useState<Set<string>>(new Set());
+  const [collabStatusMessage, setCollabStatusMessage] = useState<string | null>(
+    null
+  );
+  const [reconnectAttempt, setReconnectAttempt] = useState<number>(0);
+  const [reconnectDelay, setReconnectDelay] = useState<number | null>(null);
+  const [latency, setLatency] = useState<number | null>(null);
+  const [activeUsers, setActiveUsers] = useState<Map<string, ActiveUser>>(
+    () => new Map()
+  );
+  const [syncStatus, setSyncStatus] = useState<"synced" | "syncing" | "conflict">(
+    "syncing"
+  );
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
+  const [isExtractedTextExpanded, setIsExtractedTextExpanded] = useState<boolean>(false);
+  const [isSidebarVisible, setIsSidebarVisible] = useState(true);
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+  const [toasts, setToasts] = useState<
+    Array<{
+      id: string;
+      message: string;
+      variant?: ToastVariant;
+      duration?: number | null;
+    }>
+  >([]);
   const yjsRef = useRef<{
     ydoc: Y.Doc;
-    provider: any;
+    provider: ApiGatewayWebSocketProvider;
     ytext: Y.Text;
   } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const lastSavedRef = useRef<string>("");
+  const toastRegistryRef = useRef<Map<string, string>>(new Map());
+
+  const showToast = useCallback(
+    (
+      message: string,
+      options: {
+        variant?: ToastVariant;
+        duration?: number | null;
+        key?: string;
+      } = {}
+    ) => {
+      const { variant = "success", duration = 3000, key } = options;
+      if (key) {
+        const existingId = toastRegistryRef.current.get(key);
+        if (existingId) {
+          toastRegistryRef.current.delete(key);
+          setToasts((prev) => prev.filter((toast) => toast.id !== existingId));
+        }
+      }
+      const id = `${Date.now()}-${Math.random()}`;
+      setToasts((prev) => [...prev, { id, message, variant, duration }]);
+      if (key) {
+        toastRegistryRef.current.set(key, id);
+      }
+    },
+    []
+  );
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((toast) => toast.id !== id));
+    for (const [key, value] of toastRegistryRef.current.entries()) {
+      if (value === id) {
+        toastRegistryRef.current.delete(key);
+        break;
+      }
+    }
+  }, []);
+
+  const dismissToastByKey = useCallback((key: string) => {
+    const id = toastRegistryRef.current.get(key);
+    if (id) {
+      toastRegistryRef.current.delete(key);
+      setToasts((prev) => prev.filter((toast) => toast.id !== id));
+    }
+  }, []);
+
+  const toggleSidebarVisibility = useCallback(() => {
+    setIsSidebarVisible((prev) => !prev);
+  }, []);
 
   useEffect(() => {
     const fetchTemplates = async () => {
@@ -140,6 +246,16 @@ const Editor: React.FC = () => {
     void fetchCustomPrompts();
   }, []);
 
+  // Track window width for responsive layout
+  useEffect(() => {
+    const handleResize = () => {
+      setWindowWidth(window.innerWidth);
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
   useEffect(() => {
     const fetchDocument = async () => {
       if (!documentId || documentId === "draft") {
@@ -174,6 +290,91 @@ const Editor: React.FC = () => {
     void fetchDocument();
   }, [documentId]);
 
+  useEffect(() => {
+    if (document?.updatedAt) {
+      setLastSyncTime(new Date(document.updatedAt));
+    }
+  }, [document?.updatedAt]);
+
+  // Store fetchPresence function in a ref so it can be called from WebSocket handlers
+  const fetchPresenceRef = useRef<(() => Promise<void>) | null>(null);
+
+  useEffect(() => {
+    if (!documentId || documentId === "draft") {
+      setActiveUsers(new Map());
+      fetchPresenceRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+
+    const fetchPresence = async () => {
+      try {
+        const response = await authApi.get(
+          `/documents/${documentId}/presence`,
+          {
+            // Suppress error logging for 404s (expected if endpoint not deployed)
+            validateStatus: (status) => status < 500, // Don't throw for 4xx errors
+          }
+        );
+
+        // Only process if we got a successful response
+        if (response.status === 200 && !cancelled) {
+          const data = response.data as {
+            activeUsers?: Array<{
+              userId: string;
+              userName?: string;
+              email?: string;
+              joinedAt?: number;
+            }>;
+          };
+
+          const next = new Map<string, ActiveUser>();
+          (data.activeUsers ?? []).forEach((userInfo) => {
+            // Filter out current user - only show other collaborators
+            if (userInfo.userId === user?.id) {
+              return;
+            }
+            next.set(userInfo.userId, {
+              userId: userInfo.userId,
+              userName:
+                userInfo.userName ??
+                userInfo.email?.split("@")[0] ??
+                "Collaborator",
+              status: "online",
+              joinedAt: userInfo.joinedAt ?? Date.now(),
+            });
+          });
+          setActiveUsers(next);
+        }
+        // Silently ignore 404s and other 4xx errors - presence is optional
+      } catch (error) {
+        // Only log non-404 errors in dev mode
+        if (import.meta.env.DEV) {
+          const is404 =
+            axios.isAxiosError(error) && error.response?.status === 404;
+          if (!is404) {
+            console.debug(
+              "Failed to fetch initial presence (this is optional):",
+              error
+            );
+          }
+        }
+        // Silently fail - WebSocket will provide real-time updates
+      }
+    };
+
+    // Store in ref for use by WebSocket handlers
+    fetchPresenceRef.current = fetchPresence;
+
+    void fetchPresence();
+
+    return () => {
+      cancelled = true;
+      fetchPresenceRef.current = null;
+    };
+  }, [documentId, user?.id]);
+
   // Initialize Y.js collaboration when document loads
   useEffect(() => {
     if (!documentId || documentId === "draft" || !user) {
@@ -184,32 +385,35 @@ const Editor: React.FC = () => {
       import.meta.env.VITE_WS_BASE_URL ||
       "wss://n3fxav2xid.execute-api.us-east-1.amazonaws.com/prod";
 
-    // Skip WebSocket if URL is a placeholder
-    const isPlaceholderUrl = wsBaseUrl.includes("placeholder");
-    if (isPlaceholderUrl) {
-      console.log("WebSocket collaboration disabled: placeholder URL");
+    if (!wsBaseUrl || wsBaseUrl.includes("placeholder")) {
+      console.warn("WebSocket collaboration disabled: invalid WS URL");
       return;
     }
 
-    // Disable WebSocket collaboration for now to avoid console errors
-    // TODO: Re-enable once WebSocket connection issues are resolved
-    return;
+    let cancelled = false;
+    let teardown: (() => void) | null = null;
 
-    // Get JWT token for WebSocket
-    // Note: Since JWT is in httpOnly cookie, we fetch it from /auth/ws-token endpoint
     const initYjs = async () => {
       try {
+        setCollabState("connecting");
+        setCollabStatusMessage(null);
+        setSyncStatus("syncing");
+
         let jwt = "";
         try {
           const tokenResponse = await authApi.get("/auth/ws-token");
           jwt = (tokenResponse.data as { token: string }).token;
         } catch (error) {
-          // Silently fail - collaboration is optional
           console.debug("WebSocket collaboration unavailable:", error);
+          setCollabState("error");
+          setCollabStatusMessage("Unable to fetch collaboration token.");
           return;
         }
 
-        // Initialize Y.js
+        if (cancelled) {
+          return;
+        }
+
         const { ydoc, provider, ytext } = initCollabDoc(
           documentId,
           jwt,
@@ -218,122 +422,475 @@ const Editor: React.FC = () => {
 
         yjsRef.current = { ydoc, provider, ytext };
 
-        // Small delay before connecting to ensure token is ready
-        // This helps avoid the initial connection error
+        const handleStatus = (event: any) => {
+          // Refetch presence when connection is established to see other active users
+          // This handles the case where a user reloads and needs to see who's already connected
+          const payload = Array.isArray(event) ? event[0] : event;
+          if (payload?.status === "connected" && fetchPresenceRef.current) {
+            // Delay to ensure connection is fully established in DynamoDB
         setTimeout(() => {
-          if (yjsRef.current?.provider) {
-            yjsRef.current.provider.connect();
+              void fetchPresenceRef.current?.();
+            }, 1000);
           }
-        }, 100);
+          if (!payload || typeof payload !== "object") {
+            console.warn(
+              "[Editor] Status event received with invalid payload:",
+              event
+            );
+            return;
+          }
 
-        // Set up event listeners
-        provider.on("status", (event: any) => {
-          const status = event[0]?.status;
-          if (status === "connected") {
+          if (import.meta.env.DEV) {
+            console.log("[Editor] Status event received:", payload);
+          }
+
+          const messageMap: Record<string, string> = {
+            "missing-token": "Missing authentication token for collaboration.",
+            "abnormal-closure":
+              "Connection closed unexpectedly. Please refresh.",
+            "max-retries-exceeded":
+              "Unable to reconnect. Please refresh to continue collaborating.",
+          };
+
+          const friendlyMessage = payload.message
+            ? messageMap[payload.message] ?? String(payload.message)
+            : payload.delay
+            ? `Reconnecting in ${(payload.delay / 1000).toFixed(1)}s`
+            : null;
+
+          setCollabStatusMessage(friendlyMessage);
+
+          switch (payload.status) {
+            case "connected": {
             setCollabState("connected");
-          } else if (status === "disconnected") {
-            setCollabState("disconnected");
-          } else if (status === "error") {
+              setReconnectAttempt(0);
+              setReconnectDelay(null);
+              setSyncStatus("synced");
+              dismissToastByKey(COLLAB_TOAST_KEYS.RECONNECTING);
+              dismissToastByKey(COLLAB_TOAST_KEYS.CONNECTION_ERROR);
+              showToast("Connected to real-time collaboration", {
+                variant: "success",
+                duration: 3000,
+                key: COLLAB_TOAST_KEYS.CONNECTED,
+              });
+              if (yjsRef.current?.provider) {
+                const currentLatency = yjsRef.current.provider.getLatency();
+                if (currentLatency !== null) {
+                  setLatency(currentLatency);
+                }
+              }
+              break;
+            }
+            case "reconnecting": {
+              setCollabState("reconnecting");
+              setSyncStatus("syncing");
+              const attemptValue =
+                typeof payload.attempt === "number" ? payload.attempt : 1;
+              setReconnectAttempt(attemptValue);
+              setReconnectDelay(payload.delay ?? null);
+              const maxAttempts = payload.maxAttempts ?? 5;
+              showToast(
+                `Connection lost. Reconnecting... (Attempt ${attemptValue}/${maxAttempts})`,
+                {
+                  variant: "warning",
+                  duration: null,
+                  key: COLLAB_TOAST_KEYS.RECONNECTING,
+                }
+              );
+              break;
+            }
+            case "failed": {
+              setCollabState("failed");
+              setSyncStatus("syncing");
+              setReconnectAttempt(0);
+              setReconnectDelay(null);
+              dismissToastByKey(COLLAB_TOAST_KEYS.RECONNECTING);
+              showToast(
+                "Unable to connect. Click to retry or refresh the page.",
+                {
+                  variant: "error",
+                  duration: null,
+                  key: COLLAB_TOAST_KEYS.CONNECTION_ERROR,
+                }
+              );
+              break;
+            }
+            case "error": {
             setCollabState("error");
+              setSyncStatus("syncing");
+              setReconnectAttempt(0);
+              setReconnectDelay(null);
+              showToast(
+                "Collaboration offline. Changes will sync when connection is restored.",
+                { variant: "error", duration: 5000 }
+              );
+              break;
+            }
+            case "connecting": {
+              setCollabState("connecting");
+              setSyncStatus("syncing");
+              setReconnectDelay(null);
+              break;
+            }
+            case "disconnected": {
+              setCollabState("disconnected");
+              setSyncStatus("syncing");
+              setReconnectAttempt(0);
+              setReconnectDelay(null);
+              break;
+            }
+            default:
+              break;
           }
-        });
+        };
 
-        provider.on("presence", (event: any) => {
-          const message = event[0];
+        const handlePresence = (event: any) => {
+          const message = Array.isArray(event) ? event[0] : event;
+          
+          if (import.meta.env.DEV) {
+            console.log("[Editor] Presence event received:", message);
+          }
+          
+          if (!message?.userId || message.userId === user?.id) {
+            if (import.meta.env.DEV) {
+              console.log("[Editor] Filtering out current user or invalid message");
+            }
+            return;
+          }
+
+          const userName =
+            message.userName ||
+            message.email?.split?.("@")?.[0] ||
+            "Collaborator";
+
           if (message.action === "join") {
-            setActiveUsers((prev) => new Set([...prev, message.userId]));
+            if (import.meta.env.DEV) {
+              console.log(`[Editor] User ${userName} (${message.userId}) joined`);
+            }
+            setActiveUsers((prev) => {
+              const next = new Map(prev);
+              next.set(message.userId, {
+                userId: message.userId,
+                userName,
+                status: "online",
+                joinedAt: message.timestamp || Date.now(),
+              });
+              return next;
+            });
+            showToast(`${userName} joined the document`, {
+              variant: "success",
+              duration: 2500,
+            });
+            showToast(
+              "Another user is editing. Changes will sync automatically.",
+              {
+                variant: "info",
+                duration: 4000,
+                key: COLLAB_TOAST_KEYS.COLLABORATOR_PRESENT,
+              }
+            );
           } else if (message.action === "leave") {
             setActiveUsers((prev) => {
-              const next = new Set(prev);
+              const next = new Map(prev);
               next.delete(message.userId);
+              if (next.size === 0) {
+                dismissToastByKey(COLLAB_TOAST_KEYS.COLLABORATOR_PRESENT);
+              }
+              return next;
+            });
+            showToast(`${userName} left the document`, {
+              variant: "warning",
+              duration: 2500,
+            });
+          } else if (message.cursor || message.selection) {
+            // User is actively editing (typing indicator)
+            setActiveUsers((prev) => {
+              const next = new Map(prev);
+              const existing = next.get(message.userId);
+              if (existing) {
+                next.set(message.userId, {
+                  ...existing,
+                  status: "typing",
+                });
+                // Reset to online after 3 seconds of no activity
+                setTimeout(() => {
+                  setActiveUsers((current) => {
+                    const updated = new Map(current);
+                    const user = updated.get(message.userId);
+                    if (user && user.status === "typing") {
+                      updated.set(message.userId, {
+                        ...user,
+                        status: "online",
+                      });
+                    }
+                    return updated;
+                  });
+                }, 3000);
+              } else {
+                // User not in map yet, add them
+                next.set(message.userId, {
+                  userId: message.userId,
+                  userName,
+                  status: "typing",
+                  joinedAt: Date.now(),
+                });
+              }
               return next;
             });
           }
+        };
+
+        const handleProviderError = (event: any) => {
+          const payload = Array.isArray(event) ? event[0] : event;
+          if (!payload) {
+            return;
+          }
+          const type = String(payload.type ?? payload.code ?? "error").toLowerCase();
+          const messageText =
+            payload.message ??
+            payload.error ??
+            "Collaboration error occurred.";
+
+          if (type.includes("access")) {
+            showToast("You no longer have access to this document", {
+              variant: "error",
+              duration: null,
+              key: COLLAB_TOAST_KEYS.ACCESS_DENIED,
+            });
+          } else if (type.includes("connection_limit")) {
+            showToast(
+              "Maximum connections reached. Close other tabs or devices to continue.",
+              {
+                variant: "error",
+                duration: null,
+                key: COLLAB_TOAST_KEYS.CONNECTION_ERROR,
+              }
+            );
+          } else if (type === "manual_sync_failed") {
+            showToast(messageText, { variant: "error", duration: 5000 });
+          } else {
+            showToast(messageText, { variant: "error", duration: 5000 });
+          }
+
+          setCollabState("error");
+          setCollabStatusMessage(messageText);
+        };
+
+        const handleSyncStatusEvent = (event: any) => {
+          const payload = Array.isArray(event) ? event[0] : event;
+          if (!payload?.status) {
+            return;
+          }
+          setSyncStatus(payload.status);
+          if (payload.status === "synced") {
+            setLastSyncTime(new Date());
+            // Refetch presence after successful join to see other active users
+            // This ensures we see users who were already connected when we joined
+            if (fetchPresenceRef.current) {
+              // Small delay to ensure the connection is fully established in DynamoDB
+              setTimeout(() => {
+                void fetchPresenceRef.current?.();
+              }, 500);
+            }
+          }
+        };
+
+        const handleLatency = (event: any) => {
+          // lib0 Observable may pass the event directly or as an array
+          const payload = Array.isArray(event) ? event[0] : event;
+          if (payload?.latency !== undefined && payload.latency !== null) {
+            setLatency(payload.latency);
+          }
+        };
+
+        const handleYjsChange = () => {
+          // Use functional update to ensure we get the latest Y.js state
+          const newText = ytext.toString();
+          const prevText = draftText;
+          
+          if (import.meta.env.DEV) {
+            console.log(
+              `[Editor] Y.js text changed: ${prevText.length} -> ${newText.length} chars`,
+              { 
+                changed: prevText !== newText,
+                prefixMatch: prevText.substring(0, 50) === newText.substring(0, 50)
+              }
+            );
+          }
+          
+          // Mark that we're applying a remote update to prevent local edits from conflicting
+          isApplyingRemoteUpdateRef.current = true;
+          // Force update - don't check if it changed, just update
+          // This ensures we always reflect the latest Y.js state
+          setDraftText(newText);
+          // Reset the flag after a short delay to allow React to update
+          setTimeout(() => {
+            isApplyingRemoteUpdateRef.current = false;
+          }, 0);
+        };
+
+        provider.on("status", handleStatus);
+        provider.on("presence", handlePresence);
+        provider.on("error", handleProviderError);
+        provider.on("latency", handleLatency);
+        provider.on("sync-status", handleSyncStatusEvent);
+        
+        // Listen for explicit remote update events
+        provider.on("remote-update", (event: any) => {
+          const payload = Array.isArray(event) ? event[0] : event;
+          if (payload?.text !== undefined) {
+            console.log(`[Editor] Remote update event received: ${payload.beforeLength} -> ${payload.afterLength} chars`);
+            isApplyingRemoteUpdateRef.current = true;
+            setDraftText(payload.text);
+            setTimeout(() => {
+              isApplyingRemoteUpdateRef.current = false;
+            }, 0);
+          }
         });
+        
+        // Observe Y.Text changes - this fires for both local and remote updates
+        // When a remote update is applied via Y.applyUpdate, ytext.observe should fire
+        ytext.observe(handleYjsChange);
+        
+        // Also observe document updates as a fallback to catch remote updates
+        // This ensures we catch updates even if ytext.observe doesn't fire for some reason
+        const handleDocUpdate = (update: Uint8Array, origin: any) => {
+          // Only handle remote updates (from provider), local updates are handled by ytext.observe
+          if (origin === provider) {
+            // Use requestAnimationFrame to ensure Y.js has applied the update
+            requestAnimationFrame(() => {
+              const currentText = ytext.toString();
+              // Force update - don't check if it changed, just update
+              // This ensures we always reflect the latest Y.js state
+              isApplyingRemoteUpdateRef.current = true;
+              setDraftText(currentText);
+              setTimeout(() => {
+                isApplyingRemoteUpdateRef.current = false;
+              }, 0);
+            });
+          }
+        };
+        ydoc.on("update", handleDocUpdate);
 
         // Initialize Y.js text with current draft text (only if empty)
         if (document?.draftText && ytext.length === 0) {
           ytext.insert(0, document.draftText);
           setDraftText(document.draftText);
+        } else {
+          setDraftText(ytext.toString());
         }
 
-        // Sync Y.js text with React state (for initial load and remote updates)
-        const handleYjsChange = () => {
-          const newText = ytext.toString();
-          if (newText !== draftText) {
-            setDraftText(newText);
+        // Connect after listeners are registered
+        provider.connect();
+
+        // Fallback: Periodic check of WebSocket state to ensure UI stays in sync
+        // This handles cases where Observable events might not fire
+        const statusCheckInterval = setInterval(() => {
+          if (yjsRef.current?.provider) {
+            const actualStatus = yjsRef.current.provider.getStatus();
+            // Use functional update to get current state
+            setCollabState((currentState) => {
+              if (
+                actualStatus === "connected" &&
+                currentState !== "connected"
+              ) {
+                if (import.meta.env.DEV) {
+                  console.log(
+                    "[Editor] Fallback: Detected connected state, updating UI"
+                  );
+                }
+                setReconnectAttempt(0);
+                setReconnectDelay(null);
+                // Get latency if available
+                if (yjsRef.current?.provider) {
+                  const currentLatency = yjsRef.current.provider.getLatency();
+                  if (currentLatency !== null) {
+                    setLatency(currentLatency);
+                  }
+                }
+                return "connected";
+              } else if (
+                actualStatus === "disconnected" &&
+                currentState === "connected"
+              ) {
+                if (import.meta.env.DEV) {
+                  console.log(
+                    "[Editor] Fallback: Detected disconnected state, updating UI"
+                  );
+                }
+                setReconnectDelay(null);
+                return "disconnected";
+              }
+              return currentState;
+            });
           }
+        }, 500); // Check every 500ms
+
+        teardown = () => {
+          clearInterval(statusCheckInterval);
+          if (typingTimeoutRef.current) {
+            clearTimeout(typingTimeoutRef.current);
+            typingTimeoutRef.current = null;
+          }
+          provider.off("status", handleStatus);
+          provider.off("presence", handlePresence);
+          provider.off("error", handleProviderError);
+          provider.off("latency", handleLatency);
+          provider.off("sync-status", handleSyncStatusEvent);
+          ytext.unobserve(handleYjsChange);
+          ydoc.off("update", handleDocUpdate);
         };
-        ytext.observe(handleYjsChange);
       } catch (error) {
         console.error("Failed to initialize Y.js collaboration:", error);
         setCollabState("error");
+        setCollabStatusMessage("Failed to initialize collaboration.");
       }
     };
 
     void initYjs();
 
-    // Cleanup on unmount
     return () => {
+      cancelled = true;
       if (yjsRef.current) {
         yjsRef.current.provider.disconnect();
         yjsRef.current.ydoc.destroy();
         yjsRef.current = null;
       }
-    };
-  }, [documentId, user, document?.draftText]);
-
-  // Auto-save draft text when it changes (debounced)
-  useEffect(() => {
-    if (!documentId || documentId === "draft" || !draftText) {
-      return;
-    }
-
-    // Debounce auto-save: wait 2 seconds after user stops typing
-    const timeoutId = setTimeout(async () => {
-      try {
-        await authApi.put(`/documents/${documentId}/draft`, {
-          draftText,
-        });
-        // Silently save - don't show message for auto-save
-      } catch (err) {
-        // Silently fail for auto-save - user can manually save if needed
-        console.error("Auto-save failed:", err);
+      setActiveUsers(new Map());
+      setCollabState("disconnected");
+      setCollabStatusMessage(null);
+      if (teardown) {
+        teardown();
       }
-    }, 2000);
+    };
+  }, [documentId, user, showToast, dismissToastByKey]);
 
-    return () => clearTimeout(timeoutId);
-  }, [draftText, documentId]);
-
-  // Sync textarea changes to Y.js (improved diffing)
-  useEffect(() => {
-    if (!yjsRef.current || !textareaRef.current) {
+  const applyDiffToYText = (newValue: string) => {
+    if (!yjsRef.current) {
       return;
     }
 
-    const textarea = textareaRef.current;
-    const ytext = yjsRef.current.ytext;
-    let isUpdatingFromYjs = false;
+    const { ytext, ydoc, provider } = yjsRef.current;
+    const currentValue = ytext.toString();
 
-    // Handle user input - sync to Y.js with better diffing
-    const handleInput = (e: Event) => {
-      if (isUpdatingFromYjs) return;
+    if (currentValue === newValue) {
+      return;
+    }
 
-      const target = e.target as HTMLTextAreaElement;
-      const currentYjsText = ytext.toString();
-      if (target.value === currentYjsText) return;
+    // Only check if WebSocket is open - don't require isSynced here
+    // The ydoc.on("update") handler will check isSynced before sending
+    if (provider.ws?.readyState !== WebSocket.OPEN) {
+      return;
+    }
 
-      const oldText = currentYjsText;
-      const newText = target.value;
-      const oldLen = oldText.length;
-      const newLen = newText.length;
+    const oldLen = currentValue.length;
+    const newLen = newValue.length;
 
-      // Find common prefix and suffix for better diffing
       let prefixLen = 0;
       while (
         prefixLen < oldLen &&
         prefixLen < newLen &&
-        oldText[prefixLen] === newText[prefixLen]
+      currentValue[prefixLen] === newValue[prefixLen]
       ) {
         prefixLen++;
       }
@@ -342,52 +899,103 @@ const Editor: React.FC = () => {
       while (
         suffixLen < oldLen - prefixLen &&
         suffixLen < newLen - prefixLen &&
-        oldText[oldLen - 1 - suffixLen] === newText[newLen - 1 - suffixLen]
+      currentValue[oldLen - 1 - suffixLen] === newValue[newLen - 1 - suffixLen]
       ) {
         suffixLen++;
       }
 
-      // Apply changes: delete middle section, insert new middle
       const deleteStart = prefixLen;
       const deleteLen = oldLen - prefixLen - suffixLen;
-      const insertText = newText.substring(prefixLen, newLen - suffixLen);
+    const insertText = newValue.substring(prefixLen, newLen - suffixLen);
 
-      if (deleteLen > 0 || insertText.length > 0) {
-        isUpdatingFromYjs = true;
+    // Use transact with null origin to ensure the update is sent to server
+    // null origin means this is a local edit, not from the provider
+    ydoc.transact(() => {
         if (deleteLen > 0) {
           ytext.delete(deleteStart, deleteLen);
         }
         if (insertText.length > 0) {
           ytext.insert(deleteStart, insertText);
         }
-        isUpdatingFromYjs = false;
+    }, null); // null origin = local edit, should be sent to server
+  };
+
+  const handleManualRetry = useCallback(() => {
+    const provider = yjsRef.current?.provider;
+    if (!provider) {
+      showToast("Collaboration is not initialized yet.", {
+        variant: "warning",
+        duration: 3000,
+      });
+      return;
+    }
+
+    provider.forceReconnect();
+    showToast("Retrying connection…", { variant: "info", duration: 2000 });
+  }, [showToast]);
+
+  const handleManualSync = useCallback(() => {
+    const provider = yjsRef.current?.provider;
+    if (!provider) {
+      showToast("Collaboration is not initialized yet.", {
+        variant: "warning",
+        duration: 3000,
+      });
+      return;
+    }
+
+    const result = provider.manualSync();
+    if (result) {
+      showToast("Manual sync triggered", { variant: "info", duration: 2000 });
+    }
+  }, [showToast]);
+
+  // Auto-save draft text periodically
+  useEffect(() => {
+    if (!documentId || documentId === "draft") {
+      return;
+    }
+
+    const saveInterval = setInterval(async () => {
+      // Always use Y.js text if available (it's the source of truth during collaboration)
+      // Fall back to draftText state if Y.js isn't initialized
+      const yTextValue =
+        yjsRef.current?.ytext
+          ? yjsRef.current.ytext.toString()
+          : draftText;
+
+      // Skip if empty or unchanged
+      if (
+        !yTextValue ||
+        yTextValue.trim() === "" ||
+        yTextValue === lastSavedRef.current
+      ) {
+        return;
       }
-    };
 
-    // Handle Y.js updates - sync to textarea
-    const handleYjsUpdate = () => {
-      if (isUpdatingFromYjs) return;
-      const yjsText = ytext.toString();
-      if (textarea.value !== yjsText) {
-        isUpdatingFromYjs = true;
-        const cursorPos = textarea.selectionStart;
-        textarea.value = yjsText;
-        // Try to restore cursor position
-        const newPos = Math.min(cursorPos, yjsText.length);
-        textarea.setSelectionRange(newPos, newPos);
-        setDraftText(yjsText);
-        isUpdatingFromYjs = false;
+      // Only save if we have a valid document ID and the text has actually changed
+      if (!documentId || documentId === "draft") {
+        return;
       }
-    };
 
-    textarea.addEventListener("input", handleInput);
-    ytext.observe(handleYjsUpdate);
+      try {
+        await authApi.put(`/documents/${documentId}/draft`, {
+          draftText: yTextValue,
+        });
+        lastSavedRef.current = yTextValue;
+        if (import.meta.env.DEV) {
+          console.log(`[Editor] Auto-saved draft (${yTextValue.length} chars)`);
+        }
+      } catch (err: any) {
+        // Only log errors that aren't access-related (those are expected for viewers)
+        if (err?.response?.status !== 403) {
+          console.error("Auto-save failed:", err);
+        }
+      }
+    }, 2000);
 
-    return () => {
-      textarea.removeEventListener("input", handleInput);
-      ytext.unobserve(handleYjsUpdate);
-    };
-  }, [yjsRef.current]);
+    return () => clearInterval(saveInterval);
+  }, [documentId, draftText]);
 
   const documentMetadata = useMemo(
     () => ({
@@ -414,11 +1022,13 @@ const Editor: React.FC = () => {
     if (!document?.extractedText) {
       return [];
     }
+    // Remove excessive line breaks (3+ newlines become 2) but preserve original formatting
     return document.extractedText
+      .replace(/\n{3,}/g, '\n\n') // Replace 3+ consecutive newlines with 2
       .split(/\n\n+/)
       .map((p) => p.trim())
       .filter((p) => p.length > 0);
-  }, [document]);
+  }, [document?.extractedText]);
 
   const enrichedTemplates = useMemo(
     () =>
@@ -471,6 +1081,14 @@ const Editor: React.FC = () => {
 
       setActionMessage("Generating draft with AI...");
       window.scrollTo({ top: 0, behavior: "smooth" });
+      showToast(
+        "AI is generating draft. Editing will be re-enabled shortly.",
+        {
+          variant: "info",
+          duration: null,
+          key: COLLAB_TOAST_KEYS.AI_OPERATION,
+        }
+      );
 
       try {
         const response = await authApi.post(
@@ -485,6 +1103,25 @@ const Editor: React.FC = () => {
 
         const { draftText } = response.data;
         setDraftText(draftText);
+        
+        // Update Y.js with the new draft text so other users see the changes
+        if (yjsRef.current && yjsRef.current.provider.isSynced) {
+          const { ytext, ydoc } = yjsRef.current;
+          // Replace entire Y.Text content with the new draft
+          ydoc.transact(() => {
+            const currentLength = ytext.length;
+            if (currentLength > 0) {
+              ytext.delete(0, currentLength);
+            }
+            if (draftText.length > 0) {
+              ytext.insert(0, draftText);
+            }
+          }, null);
+          if (import.meta.env.DEV) {
+            console.log("[Editor] Updated Y.js with generated draft text");
+          }
+        }
+        
         setActionMessage("Draft generated successfully!");
 
         // Refresh document to get updated status
@@ -503,6 +1140,8 @@ const Editor: React.FC = () => {
         setDocument(docData.document);
       } catch (err) {
         setActionMessage(`Generation failed: ${getErrorMessage(err)}`);
+      } finally {
+        dismissToastByKey(COLLAB_TOAST_KEYS.AI_OPERATION);
       }
     } else if (type === "refine") {
       if (!refinePrompt.trim()) {
@@ -519,6 +1158,14 @@ const Editor: React.FC = () => {
 
       setActionMessage("Refining draft with AI...");
       window.scrollTo({ top: 0, behavior: "smooth" });
+      showToast(
+        "AI is refining draft. Editing will be re-enabled shortly.",
+        {
+          variant: "info",
+          duration: null,
+          key: COLLAB_TOAST_KEYS.AI_OPERATION,
+        }
+      );
 
       try {
         const response = await authApi.post("/ai/refine", {
@@ -528,6 +1175,25 @@ const Editor: React.FC = () => {
 
         const { draftText } = response.data;
         setDraftText(draftText);
+        
+        // Update Y.js with the refined draft text so other users see the changes
+        if (yjsRef.current && yjsRef.current.provider.isSynced) {
+          const { ytext, ydoc } = yjsRef.current;
+          // Replace entire Y.Text content with the refined draft
+          ydoc.transact(() => {
+            const currentLength = ytext.length;
+            if (currentLength > 0) {
+              ytext.delete(0, currentLength);
+            }
+            if (draftText.length > 0) {
+              ytext.insert(0, draftText);
+            }
+          }, null);
+          if (import.meta.env.DEV) {
+            console.log("[Editor] Updated Y.js with refined draft text");
+          }
+        }
+        
         setActionMessage(
           "Draft refined successfully! View history to see all versions."
         );
@@ -551,6 +1217,8 @@ const Editor: React.FC = () => {
         setRefinePrompt("");
       } catch (err) {
         setActionMessage(`Refinement failed: ${getErrorMessage(err)}`);
+      } finally {
+        dismissToastByKey(COLLAB_TOAST_KEYS.AI_OPERATION);
       }
     } else if (type === "export") {
       if (!documentId || documentId === "draft") {
@@ -591,6 +1259,32 @@ const Editor: React.FC = () => {
       }
     }
   };
+
+  const keyboardShortcuts = useMemo(() => {
+    const shortcuts = [
+      {
+        key: "c",
+        ctrl: true,
+        shift: true,
+        handler: toggleSidebarVisibility,
+      },
+      // Removed Cmd+Shift+R handler - conflicts with browser hard refresh
+      // Retry functionality is available via the "Retry" button in ConnectionStatusBadge
+    ];
+
+    if (import.meta.env.DEV) {
+      shortcuts.push({
+        key: "s",
+        ctrl: true,
+        shift: true,
+        handler: handleManualSync,
+      });
+    }
+
+    return shortcuts;
+  }, [handleManualSync, toggleSidebarVisibility]);
+
+  useKeyboardShortcuts(keyboardShortcuts);
 
   const handlePromptSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -711,10 +1405,48 @@ const Editor: React.FC = () => {
     gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
   };
 
-  const gridStylesDesktop: CSSProperties = {
-    ...gridStyles,
-    gridTemplateColumns: "320px 1fr",
-  };
+  // Responsive grid: 3 columns on large screens, 2 columns on medium, 1 column on small
+  // Adjusts based on sidebar visibility - when hidden, draft controls expand to fill space
+  // Compute screen size breakpoints (used in multiple places)
+  const isExtraWideScreen = windowWidth >= 1600;
+  const isLargeScreen = windowWidth >= 1200;
+  const isMediumScreen = windowWidth >= 768 && windowWidth < 1200;
+
+  const gridStylesDesktop: CSSProperties = useMemo(() => {
+
+    // Determine grid template columns based on screen size and sidebar visibility
+    let gridTemplateColumns: string;
+    
+    if (isSidebarVisible) {
+      // Sidebar visible: 3 columns (refinement prompt, draft controls, active users)
+      if (isExtraWideScreen) {
+        gridTemplateColumns = "280px 1fr 200px"; // Extra-wide: narrower side panels
+      } else if (isLargeScreen) {
+        gridTemplateColumns = "320px 1fr 220px"; // Large: standard 3 columns
+      } else if (isMediumScreen) {
+        gridTemplateColumns = "1fr 220px"; // Medium: draft controls + active users
+      } else {
+        gridTemplateColumns = "1fr"; // Small: single column
+      }
+    } else {
+      // Sidebar hidden: 2 columns (refinement prompt, draft controls) - draft controls expand
+      if (isExtraWideScreen) {
+        gridTemplateColumns = "280px 1fr"; // Extra-wide: refinement prompt + expanded draft controls
+      } else if (isLargeScreen) {
+        gridTemplateColumns = "320px 1fr"; // Large: refinement prompt + expanded draft controls
+      } else if (isMediumScreen) {
+        gridTemplateColumns = "1fr"; // Medium: single column (refinement prompt spans full width)
+      } else {
+        gridTemplateColumns = "1fr"; // Small: single column
+      }
+    }
+
+    return {
+      display: "grid",
+      gap: "24px",
+      gridTemplateColumns,
+    };
+  }, [isSidebarVisible, windowWidth]);
 
   const cardStyles: CSSProperties = {
     borderRadius: "22px",
@@ -729,6 +1461,12 @@ const Editor: React.FC = () => {
     gap: "16px",
     minWidth: 0, // Allow flex items to shrink below their content size
     overflow: "hidden" as const, // Prevent content from spilling out
+  };
+
+  // Style for refinement prompt aside - spans full width on medium screens
+  const refinementPromptStyles: CSSProperties = {
+    ...cardStyles,
+    gridColumn: isMediumScreen ? "1 / -1" : undefined, // Span all columns on medium screens
   };
 
   const sectionTitleStyles: CSSProperties = {
@@ -749,7 +1487,7 @@ const Editor: React.FC = () => {
     flex: 1,
     display: "flex",
     flexDirection: "column",
-    gap: "16px",
+    gap: "8px",
     overflowY: "auto" as const,
     paddingRight: "4px",
     fontSize: "14px",
@@ -757,11 +1495,12 @@ const Editor: React.FC = () => {
   };
 
   const paragraphStyles: CSSProperties = {
-    borderRadius: "14px",
+    borderRadius: "8px",
     background: "rgba(15, 23, 42, 0.4)",
-    padding: "12px",
-    lineHeight: 1.4,
-    marginBottom: "8px",
+    padding: "8px 12px",
+    lineHeight: 1.5,
+    marginBottom: "4px",
+    whiteSpace: "pre-wrap" as const,
   };
 
   const errorTextStyles: CSSProperties = {
@@ -869,6 +1608,15 @@ const Editor: React.FC = () => {
   };
 
   return (
+    <CollaborationErrorBoundary
+      onError={() =>
+        showToast("Collaboration error. Please refresh this page.", {
+          variant: "error",
+          duration: null,
+          key: COLLAB_TOAST_KEYS.ERROR_BOUNDARY,
+        })
+      }
+    >
     <div style={pageStyles}>
       <header style={headerStyles}>
         <div style={headerContainerStyles}>
@@ -883,9 +1631,21 @@ const Editor: React.FC = () => {
               {!loadingDocument && document && (
                 <p style={headerMetaStyles}>
                   Uploaded{" "}
-                  {new Date(documentMetadata.uploadedAt).toLocaleString()} •
-                  Last updated{" "}
-                  {new Date(documentMetadata.lastGenerated).toLocaleString()}
+                  {new Date(documentMetadata.uploadedAt).toLocaleString(
+                    undefined,
+                    {
+                      dateStyle: "medium",
+                      timeStyle: "short",
+                    }
+                  )}{" "}
+                  • Last updated{" "}
+                  {new Date(documentMetadata.lastGenerated).toLocaleString(
+                    undefined,
+                    {
+                      dateStyle: "medium",
+                      timeStyle: "short",
+                    }
+                  )}
                 </p>
               )}
             </div>
@@ -954,6 +1714,97 @@ const Editor: React.FC = () => {
               >
                 View history
               </button>
+              {documentId !== "draft" && (
+                <button
+                  type="button"
+                  onClick={() => setIsShareModalOpen(true)}
+                  style={{
+                    borderRadius: "14px",
+                    border: "1px solid rgba(59, 130, 246, 0.5)",
+                    background: "rgba(30, 64, 175, 0.4)",
+                    padding: "6px 12px",
+                    fontSize: "13px",
+                    fontWeight: 500,
+                    color: "rgba(219, 234, 254, 0.95)",
+                    cursor: "pointer",
+                    transition:
+                      "border-color 0.2s ease, color 0.2s ease, background 0.2s ease",
+                    textDecoration: "none",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor =
+                      "rgba(96, 165, 250, 0.8)";
+                    e.currentTarget.style.color = "#e0f2fe";
+                    e.currentTarget.style.background = "rgba(30, 64, 175, 0.55)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor =
+                      "rgba(59, 130, 246, 0.5)";
+                    e.currentTarget.style.color = "rgba(219, 234, 254, 0.95)";
+                    e.currentTarget.style.background = "rgba(30, 64, 175, 0.4)";
+                  }}
+                >
+                  Share
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={toggleSidebarVisibility}
+                aria-pressed={!isSidebarVisible}
+                title="Toggle collaborators sidebar (Ctrl+Shift+C)"
+                aria-label={
+                  isSidebarVisible
+                    ? "Hide active collaborators panel"
+                    : "Show active collaborators panel"
+                }
+                style={{
+                  borderRadius: "14px",
+                  border: "1px solid rgba(71, 85, 105, 0.5)",
+                  background: isSidebarVisible
+                    ? "rgba(15, 23, 42, 0.5)"
+                    : "rgba(71, 85, 105, 0.4)",
+                  padding: "6px 12px",
+                  fontSize: "13px",
+                  fontWeight: 500,
+                  color: "rgba(241, 245, 249, 0.9)",
+                  cursor: "pointer",
+                  transition:
+                    "border-color 0.2s ease, color 0.2s ease, background 0.2s ease",
+                  textDecoration: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "4px",
+                }}
+              >
+                {isSidebarVisible ? "Hide collaborators" : "Show collaborators"}
+              </button>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <ConnectionStatusBadge
+                  status={collabState}
+                  reconnectAttempt={reconnectAttempt}
+                  reconnectDelay={reconnectDelay}
+                  latency={latency}
+                  onRetry={handleManualRetry}
+                />
+                <SyncStatusIndicator
+                  status={syncStatus}
+                  lastSyncTime={lastSyncTime}
+                  showManualSync={import.meta.env.DEV}
+                  onManualSync={
+                    import.meta.env.DEV ? handleManualSync : undefined
+                  }
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -963,62 +1814,54 @@ const Editor: React.FC = () => {
         {actionMessage && <div style={messageStyles}>{actionMessage}</div>}
 
         <div style={gridStylesDesktop}>
-          <aside style={cardStyles}>
-            <div>
-              <h2 style={sectionTitleStyles}>Extracted text</h2>
-              <p style={sectionDescriptionStyles}>
-                Parsed from the uploaded document for reference during drafting.
-              </p>
-            </div>
-            <div style={textContentStyles}>
-              {loadingDocument ? (
-                <p
+          <aside style={refinementPromptStyles}>
+            <form onSubmit={handlePromptSubmit} style={formStyles}>
+              <label htmlFor="refine-prompt" style={sectionTitleStyles}>
+                Refinement prompt
+              </label>
+              <div
                   style={{
-                    color: "rgba(148, 163, 184, 0.8)",
-                    fontSize: "14px",
+                  marginTop: "12px",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "12px",
+                }}
+              >
+                <textarea
+                  id="refine-prompt"
+                  value={refinePrompt}
+                  onChange={(event) => setRefinePrompt(event.target.value)}
+                  rows={3}
+                  style={formTextareaStyles}
+                  placeholder="Clarify tone, add citations, or request new sections."
+                  onFocus={(e) => {
+                    e.currentTarget.style.borderColor = "rgba(16, 185, 129, 0.8)";
+                    e.currentTarget.style.boxShadow =
+                      "0 0 0 3px rgba(16, 185, 129, 0.2)";
+                  }}
+                  onBlur={(e) => {
+                    e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+                    e.currentTarget.style.boxShadow = "none";
+                  }}
+                />
+                <button
+                  type="submit"
+                  style={buttonPrimaryStyles}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.transform = "translateY(-2px)";
+                    e.currentTarget.style.boxShadow =
+                      "0 22px 35px -22px rgba(16, 185, 129, 0.65)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow =
+                      "0 18px 30px -20px rgba(16, 185, 129, 0.55)";
                   }}
                 >
-                  Loading extracted text...
-                </p>
-              ) : documentError ? (
-                <p style={errorTextStyles}>Error: {documentError}</p>
-              ) : isExtractedTextCorrupted ? (
-                <div>
-                  <p
-                    style={{
-                      color: "rgba(248, 113, 113, 0.9)",
-                      fontSize: "14px",
-                      marginBottom: "8px",
-                    }}
-                  >
-                    ⚠️ Extracted text appears to be corrupted or unreadable.
-                  </p>
-                  <p
-                    style={{
-                      color: "rgba(148, 163, 184, 0.8)",
-                      fontSize: "13px",
-                    }}
-                  >
-                    Please re-upload the document to extract the text properly.
-                  </p>
-                </div>
-              ) : extractedParagraphs.length === 0 ? (
-                <p
-                  style={{
-                    color: "rgba(148, 163, 184, 0.8)",
-                    fontSize: "14px",
-                  }}
-                >
-                  No extracted text available
-                </p>
-              ) : (
-                extractedParagraphs.map((paragraph, idx) => (
-                  <p key={idx} style={paragraphStyles}>
-                    {paragraph}
-                  </p>
-                ))
-              )}
+                  Queue refinement
+                </button>
             </div>
+            </form>
           </aside>
 
           <section style={cardStyles}>
@@ -1191,8 +2034,29 @@ const Editor: React.FC = () => {
                   id="draft"
                   value={draftText}
                   onChange={(event) => {
-                    setDraftText(event.target.value);
-                    // Y.js sync is handled by the input event listener
+                    // Skip if we're currently applying a remote update
+                    if (isApplyingRemoteUpdateRef.current) {
+                      return;
+                    }
+                    const newValue = event.target.value;
+                    setDraftText(newValue);
+                    
+                    // Always try to apply to Y.js if provider exists and WebSocket is open
+                    // The provider will handle whether to send based on isSynced internally
+                    if (yjsRef.current && yjsRef.current.provider.ws?.readyState === WebSocket.OPEN) {
+                      const provider = yjsRef.current.provider;
+                      applyDiffToYText(newValue);
+                      // Send typing indicator
+                      provider.sendPresence();
+                      // Clear previous timeout
+                      if (typingTimeoutRef.current) {
+                        clearTimeout(typingTimeoutRef.current);
+                      }
+                      // Set timeout to stop typing indicator after 2 seconds of inactivity
+                      typingTimeoutRef.current = window.setTimeout(() => {
+                        // Typing stopped - presence will be updated on next activity
+                      }, 2000);
+                    }
                   }}
                   rows={25}
                   style={{
@@ -1221,70 +2085,145 @@ const Editor: React.FC = () => {
                     color: "rgba(100, 116, 139, 0.8)",
                   }}
                 >
-                  {collabState === "connected"
-                    ? "Changes sync live to all collaborators in real-time."
-                    : collabState === "connecting"
-                    ? "Connecting to collaboration server..."
-                    : "Collaboration offline. Changes will sync when connection is restored."}
+                  {collabState === "connected" &&
+                    (activeUsers.size > 0
+                      ? `${activeUsers.size} collaborator${
+                          activeUsers.size === 1 ? "" : "s"
+                        } currently editing.`
+                      : "Changes sync live to all collaborators in real-time.")}
+                  {collabState === "connecting" &&
+                    "Connecting to collaboration server..."}
+                  {collabState === "reconnecting" &&
+                    (collabStatusMessage ||
+                      "Connection lost. Attempting to reconnect...")}
+                  {collabState === "failed" &&
+                    (collabStatusMessage ||
+                      "Unable to reconnect. Please refresh to retry.")}
+                  {collabState === "error" &&
+                    (collabStatusMessage ||
+                      "Collaboration offline. Changes will sync when connection is restored.")}
+                  {collabState === "disconnected" &&
+                    "Collaboration offline. Changes will sync when connection is restored."}
                 </p>
               </div>
             </div>
           </section>
+
+          {/* Active Users Panel - Third Column */}
+          {documentId && documentId !== "draft" && isSidebarVisible && (
+            <aside style={cardStyles}>
+              <ActiveUsersSidebar
+                activeUsers={activeUsers}
+                currentUserId={user?.id}
+                inline={true}
+              />
+            </aside>
+          )}
         </div>
 
-        <form onSubmit={handlePromptSubmit} style={formStyles}>
-          <label htmlFor="refine-prompt" style={sectionTitleStyles}>
-            Refinement prompt
-          </label>
+        <aside style={cardStyles}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "12px" }}>
+            <div>
+              <h2 style={sectionTitleStyles}>Extracted text</h2>
           <p style={sectionDescriptionStyles}>
-            Describe the adjustments you need. AI refinement (PR13) will
-            generate a new draft version and preserve history automatically.
-          </p>
-          <div
-            style={{
-              marginTop: "12px",
-              display: "flex",
-              flexDirection: "column",
-              gap: "12px",
-            }}
-          >
-            <textarea
-              id="refine-prompt"
-              value={refinePrompt}
-              onChange={(event) => setRefinePrompt(event.target.value)}
-              rows={3}
-              style={formTextareaStyles}
-              placeholder="Clarify tone, add citations, or request new sections."
-              onFocus={(e) => {
-                e.currentTarget.style.borderColor = "rgba(16, 185, 129, 0.8)";
-                e.currentTarget.style.boxShadow =
-                  "0 0 0 3px rgba(16, 185, 129, 0.2)";
-              }}
-              onBlur={(e) => {
-                e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
-                e.currentTarget.style.boxShadow = "none";
-              }}
-            />
+                Parsed from the uploaded document for reference during drafting.
+              </p>
+            </div>
             <button
-              type="submit"
-              style={buttonPrimaryStyles}
+              type="button"
+              onClick={() => setIsExtractedTextExpanded(!isExtractedTextExpanded)}
+              aria-label={isExtractedTextExpanded ? "Collapse extracted text" : "Expand extracted text"}
+            style={{
+                borderRadius: "8px",
+                border: "1px solid rgba(71, 85, 105, 0.5)",
+                background: "rgba(15, 23, 42, 0.5)",
+                padding: "6px 12px",
+                fontSize: "12px",
+                fontWeight: 500,
+                color: "rgba(241, 245, 249, 0.9)",
+                cursor: "pointer",
+                transition: "border-color 0.2s ease, color 0.2s ease, background 0.2s ease",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
               onMouseEnter={(e) => {
-                e.currentTarget.style.transform = "translateY(-2px)";
-                e.currentTarget.style.boxShadow =
-                  "0 22px 35px -22px rgba(16, 185, 129, 0.65)";
+                e.currentTarget.style.borderColor = "rgba(148, 163, 184, 0.6)";
+                e.currentTarget.style.color = "#f8fafc";
+                e.currentTarget.style.background = "rgba(15, 23, 42, 0.7)";
               }}
               onMouseLeave={(e) => {
-                e.currentTarget.style.transform = "translateY(0)";
-                e.currentTarget.style.boxShadow =
-                  "0 18px 30px -20px rgba(16, 185, 129, 0.55)";
+                e.currentTarget.style.borderColor = "rgba(71, 85, 105, 0.5)";
+                e.currentTarget.style.color = "rgba(241, 245, 249, 0.9)";
+                e.currentTarget.style.background = "rgba(15, 23, 42, 0.5)";
               }}
             >
-              Queue refinement
+              {isExtractedTextExpanded ? "−" : "+"}
             </button>
           </div>
-        </form>
+          {isExtractedTextExpanded && (
+          <div style={textContentStyles}>
+            {loadingDocument ? (
+              <p
+                style={{
+                  color: "rgba(148, 163, 184, 0.8)",
+                  fontSize: "14px",
+                }}
+              >
+                Loading extracted text...
+              </p>
+            ) : documentError ? (
+              <p style={errorTextStyles}>Error: {documentError}</p>
+            ) : isExtractedTextCorrupted ? (
+              <div>
+                <p
+                  style={{
+                    color: "rgba(248, 113, 113, 0.9)",
+                    fontSize: "14px",
+                    marginBottom: "8px",
+                  }}
+                >
+                  ⚠️ Extracted text appears to be corrupted or unreadable.
+                </p>
+                <p
+                  style={{
+                    color: "rgba(148, 163, 184, 0.8)",
+                    fontSize: "13px",
+                  }}
+                >
+                  Please re-upload the document to extract the text properly.
+                </p>
+              </div>
+            ) : extractedParagraphs.length === 0 ? (
+              <p
+                style={{
+                  color: "rgba(148, 163, 184, 0.8)",
+                  fontSize: "14px",
+                }}
+              >
+                No extracted text available
+              </p>
+            ) : (
+              extractedParagraphs.map((paragraph, idx) => (
+                <p key={idx} style={paragraphStyles}>
+                  {paragraph}
+                </p>
+              ))
+            )}
+          </div>
+          )}
+        </aside>
       </main>
+      {documentId && documentId !== "draft" && (
+        <ShareModal
+          documentId={documentId}
+          isOpen={isShareModalOpen}
+          onClose={() => setIsShareModalOpen(false)}
+        />
+      )}
+        <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </div>
+    </CollaborationErrorBoundary>
   );
 };
 

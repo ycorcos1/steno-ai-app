@@ -23,7 +23,8 @@ const lastSnapshotTime = new Map<string, number>();
  */
 export async function joinRoom(
   documentId: string,
-  userId: string
+  userId: string,
+  lastKnownVersion: number | null = null
 ): Promise<{
   snapshot: Buffer | null;
   ops: Buffer[];
@@ -35,18 +36,7 @@ export async function joinRoom(
     return null;
   }
 
-  // Get latest snapshot
-  const snapshot = await getLatestSnapshot(documentId);
-  const version = snapshot?.version || null;
-
-  // Get ops since snapshot (or all ops if no snapshot)
-  const ops = await getOpsSince(documentId, version);
-
-  return {
-    snapshot: snapshot?.snapshot_bytes || null,
-    ops: ops.map((op) => op.op_bytes),
-    version,
-  };
+  return getSyncData(documentId, lastKnownVersion);
 }
 
 /**
@@ -101,8 +91,14 @@ export async function createSnapshot(
   snapshotBytes: Buffer
 ): Promise<number> {
   const version = await getNextSnapshotVersion(documentId);
-  await saveSnapshot(documentId, version, snapshotBytes);
+  const snapshot = await saveSnapshot(documentId, version, snapshotBytes);
+  
+  // If snapshot is null, it means another client already created this version
+  // This is fine - we'll just use the existing version
+  if (snapshot) {
   lastSnapshotTime.set(documentId, Date.now());
+  }
+  
   return version;
 }
 

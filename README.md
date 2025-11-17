@@ -235,7 +235,19 @@ StenoAI was built to streamline the legal drafting process and reduce manual wor
 - **Prompt Library**: Organize prompts for common refinement tasks
 - **Quick Selection**: Select prompts directly in the editor interface
 
-### 7. **Authentication & Security**
+### 7. **Real-Time Collaboration**
+
+- **Live Editing**: Multiple users can edit the same document simultaneously with real-time synchronization
+- **Y.js CRDT**: Conflict-free replicated data type (CRDT) ensures all changes merge seamlessly
+- **Presence System**: See who's currently viewing or editing the document with live user indicators
+- **Typing Indicators**: Visual feedback when other users are actively typing
+- **Connection Status**: Real-time connection status and latency monitoring
+- **Invitation System**: Invite collaborators via secure token-based invitations with role-based access (owner, editor, viewer)
+- **Access Control**: Granular permissions - owners can edit and share, editors can edit, viewers are read-only
+- **Automatic Sync**: Changes sync automatically across all connected clients without page refresh
+- **Offline Support**: Changes are queued and synced when connection is restored
+
+### 8. **Authentication & Security**
 
 - **JWT-Based Auth**: Secure authentication with httpOnly cookies
 - **Password Hashing**: Bcrypt password hashing with salt rounds
@@ -405,7 +417,7 @@ Environment variables are configured via:
 # Create VPC with private subnets
 bash scripts/vpc_create.sh
 
-# Create VPC endpoints (S3, Bedrock, Secrets Manager)
+# Create VPC endpoints (S3, Bedrock, Secrets Manager, DynamoDB)
 bash scripts/vpc_endpoints.sh
 ```
 
@@ -431,6 +443,16 @@ bash scripts/data_buckets_create.sh
 bash scripts/s3_lifecycle.sh
 ```
 
+**DynamoDB Tables:**
+
+```bash
+# Create DynamoDB table for WebSocket connection tracking
+bash scripts/dynamodb_create.sh
+
+# Attach DynamoDB permissions to Lambda roles
+bash scripts/attach_dynamodb_policy.sh
+```
+
 **Lambda Functions:**
 
 ```bash
@@ -450,6 +472,20 @@ bash scripts/ai_create.sh
 # (Usually done via api_create.sh script)
 ```
 
+**WebSocket Infrastructure:**
+
+```bash
+# Build and deploy WebSocket Lambda
+npm --prefix apps/api run build
+bash scripts/ws_create.sh
+```
+
+**Note:** The WebSocket Lambda requires:
+
+- DynamoDB table (`stenoai-<env>-connections`) for connection state (created above)
+- DynamoDB VPC Interface Endpoint (created via `vpc_endpoints.sh`)
+- NAT Gateway for API Gateway Management API access (created via `vpc_create.sh`)
+
 **CloudFront Distribution:**
 
 ```bash
@@ -462,6 +498,8 @@ make web-deploy
 ```
 
 #### 3. Database Setup
+
+**Note:** This section covers RDS (PostgreSQL) setup. For DynamoDB setup (required for real-time collaboration), see the "Create AWS Resources" section above.
 
 **For AWS RDS:**
 
@@ -1334,23 +1372,22 @@ aws logs tail /aws/lambda/stenoai-dev-ai --follow
 
 ## Future Developments
 
-### Real-time Collaboration
+### Enhanced Collaboration Features
 
-The following features are planned to enable real-time collaboration:
+The following enhancements are planned for real-time collaboration:
 
-- **Enhanced Presence System**:
+- **Advanced Presence System**:
 
   - Real-time cursor positions and selections
   - User avatars and names displayed in the editor
   - Visual indicators for active editors
-  - "User is typing..." indicators
 
-- **Collaboration Permissions**:
+- **Collaboration Enhancements**:
 
-  - Document-level access control (owner, editor, viewer roles)
-  - Invite collaborators via email
-  - Permission management UI
+  - Comments and annotations on specific document sections
+  - @mentions to notify collaborators
   - Activity log showing who made what changes
+  - Email notifications for invitations (currently in-app only)
 
 - **Conflict Resolution**:
 
@@ -1359,18 +1396,10 @@ The following features are planned to enable real-time collaboration:
   - Automatic conflict detection and warnings
   - Version branching for experimental edits
 
-- **Collaboration Features**:
-
-  - Comments and annotations on specific document sections
-  - @mentions to notify collaborators
-  - Shared document templates for team workflows
-  - Real-time chat sidebar for document discussions
-
 - **Performance Optimizations**:
-  - Incremental sync for large documents
   - Bandwidth optimization for slow connections
-  - Offline editing support with sync on reconnect
-  - Reduced latency for real-time updates
+  - Enhanced offline editing support with improved sync on reconnect
+  - Further latency optimizations for real-time updates
 
 ---
 

@@ -25,7 +25,7 @@ interface TemplateResponse {
 }
 
 const router = express.Router();
-router.use(express.json());
+router.use(express.json({ limit: '10mb' }));
 router.use(authenticateToken);
 
 function mapTemplate(row: TemplateRow, userId: string): TemplateResponse {

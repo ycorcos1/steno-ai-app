@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import axios from "axios";
 
 import { authApi, useAuth } from "../lib/auth";
+import { getInvitations } from "../lib/api";
 
 interface Document {
   id: string;
@@ -43,6 +44,8 @@ const Dashboard: React.FC = () => {
   const [loadingTemplates, setLoadingTemplates] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [invitationCount, setInvitationCount] = useState<number>(0);
+  const [loadingInvitations, setLoadingInvitations] = useState<boolean>(false);
 
   useEffect(() => {
     const fetchDocuments = async () => {
@@ -84,8 +87,21 @@ const Dashboard: React.FC = () => {
       }
     };
 
+    const fetchInvitations = async () => {
+      try {
+        setLoadingInvitations(true);
+        const invitations = await getInvitations();
+        setInvitationCount(invitations.length);
+      } catch (err) {
+        console.error("Failed to fetch invitations:", err);
+      } finally {
+        setLoadingInvitations(false);
+      }
+    };
+
     void fetchDocuments();
     void fetchTemplates();
+    void fetchInvitations();
   }, []);
 
   const handleDeleteDocument = async (
@@ -188,6 +204,19 @@ const Dashboard: React.FC = () => {
     display: "flex",
     flexDirection: "column",
     gap: "32px",
+  };
+
+  const invitationBannerStyles: CSSProperties = {
+    borderRadius: "18px",
+    border: "1px solid rgba(59, 130, 246, 0.35)",
+    background:
+      "linear-gradient(135deg, rgba(30, 64, 175, 0.35), rgba(30, 64, 175, 0.15))",
+    padding: "16px 20px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: "16px",
+    flexWrap: "wrap",
   };
 
   const gridStyles: CSSProperties = {
@@ -369,30 +398,104 @@ const Dashboard: React.FC = () => {
             }}
           >
             <div style={headerContentStyles}>
-              <h1 style={titleStyles}>Dashboard</h1>
+              <h1 style={titleStyles}>StenoAI</h1>
               <p style={welcomeStyles}>
                 Welcome back, {user?.email ?? "User"}.
               </p>
+              {invitationCount > 0 && (
+                <div style={invitationBannerStyles}>
+                  <div>
+                    <p
+                      style={{
+                        margin: 0,
+                        fontWeight: 600,
+                        color: "#bfdbfe",
+                        fontSize: "15px",
+                      }}
+                    >
+                      {loadingInvitations
+                        ? "Checking invitations…"
+                        : `${invitationCount} pending invitation${
+                            invitationCount === 1 ? "" : "s"
+                          }`}
+                    </p>
+                    <p
+                      style={{
+                        margin: "4px 0 0",
+                        color: "rgba(191, 219, 254, 0.85)",
+                        fontSize: "13px",
+                      }}
+                    >
+                      Collaborators are waiting to join your documents.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => navigate("/invitations")}
+                    style={{
+                      borderRadius: "12px",
+                      border: "none",
+                      background: "rgba(96, 165, 250, 0.9)",
+                      color: "#fff",
+                      padding: "10px 18px",
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Review invitations
+                  </button>
+                </div>
+              )}
             </div>
-            <button
-              type="button"
-              onClick={handleLogout}
-              style={logoutButtonStyles}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.transform = "translateY(-2px)";
-                e.currentTarget.style.borderColor = "rgba(148, 163, 184, 0.6)";
-                e.currentTarget.style.boxShadow =
-                  "0 16px 28px -20px rgba(15, 23, 42, 0.75)";
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.transform = "translateY(0)";
-                e.currentTarget.style.borderColor = "rgba(148, 163, 184, 0.35)";
-                e.currentTarget.style.boxShadow =
-                  "0 14px 24px -18px rgba(15, 23, 42, 0.7)";
-              }}
-            >
-              Log Out
-            </button>
+            <div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+              <button
+                type="button"
+                onClick={() => navigate("/invitations")}
+                style={{
+                  ...logoutButtonStyles,
+                  border: "1px solid rgba(96, 165, 250, 0.5)",
+                  color: "rgba(219, 234, 254, 0.95)",
+                  background: "rgba(30, 64, 175, 0.4)",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.transform = "translateY(-2px)";
+                  e.currentTarget.style.borderColor = "rgba(96, 165, 250, 0.8)";
+                  e.currentTarget.style.boxShadow =
+                    "0 16px 28px -20px rgba(15, 23, 42, 0.75)";
+                  e.currentTarget.style.background = "rgba(30, 64, 175, 0.55)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.transform = "translateY(0)";
+                  e.currentTarget.style.borderColor = "rgba(96, 165, 250, 0.5)";
+                  e.currentTarget.style.boxShadow =
+                    "0 14px 24px -18px rgba(15, 23, 42, 0.7)";
+                  e.currentTarget.style.background = "rgba(30, 64, 175, 0.4)";
+                }}
+              >
+                Invitations
+              </button>
+              <button
+                type="button"
+                onClick={handleLogout}
+                style={logoutButtonStyles}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.transform = "translateY(-2px)";
+                  e.currentTarget.style.borderColor =
+                    "rgba(148, 163, 184, 0.6)";
+                  e.currentTarget.style.boxShadow =
+                    "0 16px 28px -20px rgba(15, 23, 42, 0.75)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.transform = "translateY(0)";
+                  e.currentTarget.style.borderColor =
+                    "rgba(148, 163, 184, 0.35)";
+                  e.currentTarget.style.boxShadow =
+                    "0 14px 24px -18px rgba(15, 23, 42, 0.7)";
+                }}
+              >
+                Log Out
+              </button>
+            </div>
           </div>
         </div>
       </header>

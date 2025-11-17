@@ -33,7 +33,9 @@ ${safeExtracted}
     prompt += `\n**Additional Instructions:**\n${safeInstructions}\n\n`;
   }
 
-  prompt += `\nGenerate a complete, polished demand letter following the template structure and incorporating all relevant information from the extracted text. Be professional, precise, and legally appropriate.`;
+  prompt += `\nGenerate a complete, polished demand letter following the template structure and incorporating all relevant information from the extracted text. Be professional, precise, and legally appropriate.
+
+IMPORTANT: Return ONLY the demand letter text. Do not include any introductory text, explanations, meta-commentary, or phrases like "Here's a professional demand letter" or "Here is the demand letter". Start directly with the letter content (e.g., sender address, date, recipient address, salutation).`;
 
   return prompt;
 }

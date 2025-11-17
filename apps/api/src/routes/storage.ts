@@ -10,7 +10,7 @@ import { authenticateToken } from "../middleware/auth";
 import { retry } from "../lib/retry";
 
 const router = express.Router();
-router.use(express.json());
+router.use(express.json({ limit: '10mb' }));
 
 // Initialize S3 client
 const s3Client = new S3Client({

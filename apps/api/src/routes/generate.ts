@@ -1,11 +1,12 @@
 import express, { Request, Response } from "express";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
-import { query } from "../db/pg";
+import { query, checkDocumentAccess } from "../db/pg";
 import { composePrompt } from "../lib/composePrompt";
 import { mergeChunks, ChunkResult } from "../lib/merge";
 import { idempotencyMiddleware } from "../middleware/idempotency";
 import { retry } from "../lib/retry";
+import { cleanAiResponse } from "../lib/cleanAiResponse";
 import {
   LambdaClient,
   InvokeCommand,
@@ -13,7 +14,7 @@ import {
 } from "@aws-sdk/client-lambda";
 
 const router = express.Router();
-router.use(express.json());
+router.use(express.json({ limit: '10mb' }));
 
 /**
  * POST /documents/generate
@@ -53,12 +54,22 @@ router.post(
         },
       });
 
-      // Fetch document and verify ownership
+      // Check if user has access (owner or editor - viewers cannot generate drafts)
+      const access = await checkDocumentAccess(documentId, userId);
+      if (!access || access === "viewer") {
+        return res.status(403).json({ 
+          error: access === "viewer" 
+            ? "Viewers cannot generate drafts" 
+            : "Document not found" 
+        });
+      }
+
+      // Fetch document (owner or editor can proceed)
       const docResult = await query(
         `SELECT id, owner_id, extracted_text, status
          FROM documents
-         WHERE id = $1 AND owner_id = $2`,
-        [documentId, userId]
+         WHERE id = $1`,
+        [documentId]
       );
 
       if (docResult.rows.length === 0) {
@@ -196,14 +207,20 @@ router.post(
             { maxAttempts: 5, initialDelayMs: 100 }
           );
 
+          // Clean each chunk response
+          const cleanedChunkText = cleanAiResponse(aiResponse.data.text || "");
+          
           chunkResults.push({
             idx: chunk.idx as number,
-            text: aiResponse.data.text || "",
+            text: cleanedChunkText,
           });
         }
 
         // Merge chunk results
         draftText = mergeChunks(chunkResults);
+        
+        // Clean the merged result as well (in case merge adds any unwanted text)
+        draftText = cleanAiResponse(draftText);
       } else {
         // Process non-chunked document
         const prompt = composePrompt(
@@ -285,7 +302,8 @@ router.post(
           { maxAttempts: 5, initialDelayMs: 100 }
         );
 
-        draftText = aiResponse.data.text || "";
+        // Clean the response to remove any unwanted prefix text
+        draftText = cleanAiResponse(aiResponse.data.text || "");
       }
 
       // Save draft to database

@@ -1,13 +1,14 @@
 import express, { Request, Response } from "express";
 import { authenticateToken } from "../middleware/auth";
-import { query } from "../db/pg";
+import { query, checkDocumentAccess } from "../db/pg";
 import { extractText } from "../lib/extract_basic";
 import { chunkText, needsChunking } from "../lib/extract_chunked";
 import { v4 as uuidv4 } from "uuid";
 import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
 
 const router = express.Router();
-router.use(express.json());
+// Increase body size limit to 10MB for large documents
+router.use(express.json({ limit: '10mb' }));
 
 const s3Client = new S3Client({
   region: process.env.REGION || "us-east-1",
@@ -138,12 +139,18 @@ router.get("/:id", authenticateToken, async (req: Request, res: Response) => {
       return res.status(401).json({ error: "User not authenticated" });
     }
 
-    // Fetch document and verify ownership
+    // Check if user has access (owner, editor, or viewer)
+    const access = await checkDocumentAccess(id, userId);
+    if (!access) {
+      return res.status(404).json({ error: "Document not found" });
+    }
+
+    // Fetch document (user has access, so fetch it)
     const result = await query(
       `SELECT id, owner_id, key, title, extracted_text, draft_text, status, created_at, updated_at
          FROM documents
-         WHERE id = $1 AND owner_id = $2`,
-      [id, userId]
+         WHERE id = $1`,
+      [id]
     );
 
     if (result.rows.length === 0) {
@@ -184,12 +191,13 @@ router.get("/", authenticateToken, async (req: Request, res: Response) => {
       return res.status(401).json({ error: "User not authenticated" });
     }
 
-    // Fetch user's documents
+    // Fetch user's documents (owned or shared via collaboration)
     const result = await query(
-      `SELECT id, title, extracted_text, draft_text, status, created_at, updated_at
-       FROM documents
-       WHERE owner_id = $1
-       ORDER BY created_at DESC`,
+      `SELECT DISTINCT d.id, d.title, d.extracted_text, d.draft_text, d.status, d.created_at, d.updated_at
+       FROM documents d
+       LEFT JOIN document_collaborators dc ON d.id = dc.document_id AND dc.user_id = $1
+       WHERE d.owner_id = $1 OR dc.user_id = $1
+       ORDER BY d.created_at DESC`,
       [userId]
     );
 
@@ -235,32 +243,37 @@ router.put(
         return res.status(400).json({ error: "draftText must be a string" });
       }
 
-      // Verify document ownership
-      const result = await query(
-        `SELECT id, owner_id
-         FROM documents
-         WHERE id = $1 AND owner_id = $2`,
-        [id, userId]
-      );
-
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Document not found" });
+      // Check if user has access (owner or editor - viewers cannot edit)
+      const access = await checkDocumentAccess(id, userId);
+      if (!access || access === "viewer") {
+        return res.status(403).json({ 
+          error: access === "viewer" 
+            ? "Viewers cannot edit documents" 
+            : "Document not found" 
+        });
       }
 
-      // Update draft text
-      await query(
+      // Update draft text (owner or editor can save)
+      // Use retry logic from query function to handle transient DB errors
+      const result = await query(
         `UPDATE documents
          SET draft_text = $1, updated_at = NOW()
-         WHERE id = $2 AND owner_id = $3`,
-        [draftText, id, userId]
+         WHERE id = $2`,
+        [draftText, id]
       );
+
+      // Verify update succeeded
+      if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Document not found" });
+      }
 
       res.json({ success: true });
     } catch (error: any) {
       console.error("Failed to save draft:", error);
+      // Don't expose internal error details
       res.status(500).json({
         error: "Failed to save draft",
-        message: error.message,
+        message: process.env.NODE_ENV === "development" ? error.message : "Internal server error",
       });
     }
   }
