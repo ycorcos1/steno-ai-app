@@ -385,84 +385,94 @@ async function broadcastToRoom(
     console.log(
       `[WS Handler] broadcastToRoom called: documentId=${documentId}, messageType=${message.type}, excludeConnectionId=${excludeConnectionId}`
     );
-    let targets: ConnectionRecord[];
-    
-    if (connectionList) {
-      targets = connectionList;
-    } else {
-    // Always use fallback approach for better reliability with GSI eventual consistency
-    // First, try GSI query
-    const gsiTargets = await getConnectionsByDocument(documentId).catch((error) => {
-      console.error("Failed to fetch document connections via GSI:", error);
-      return [];
-    });
-    
-    console.log(
-      `[WS Handler] GSI query found ${gsiTargets.length} connection(s) for document ${documentId}`
-    );
-    
-    // Always also query by userId for all document collaborators as a fallback
-    // This works even if GSI hasn't updated yet
-    try {
-      // Get document owner and collaborators to find their connections
-      const { getDocumentCollaborators, query } = await import("../db/pg");
-      
-      // Get owner
-      const docResult = await query(
-        `SELECT owner_id FROM documents WHERE id = $1`,
-        [documentId]
-      );
-      const ownerId = docResult.rows[0]?.owner_id;
-      
-      // Get collaborators
-      const collaborators = await getDocumentCollaborators(documentId);
-      const userIds = new Set<string>();
-      if (ownerId) userIds.add(ownerId);
-      collaborators.forEach(c => userIds.add(c.userId));
-      
-      console.log(
-        `[WS Handler] Found ${userIds.size} user(s) with access to document ${documentId} (owner + collaborators)`
-      );
-      
-      // Get connections for all users (owner + collaborators)
-      const allUserConnections: ConnectionRecord[] = [];
-      for (const userId of userIds) {
-        const userConns = await getConnectionsByUser(userId);
-        allUserConnections.push(...userConns);
-        console.log(
-          `[WS Handler] User ${userId} has ${userConns.length} active connection(s)`
-        );
+    const seenConnectionIds = new Set<string>();
+    let targets: ConnectionRecord[] = [];
+
+    const addTargets = (records: ConnectionRecord[]) => {
+      for (const record of records) {
+        if (!record.connectionId) continue;
+        if (seenConnectionIds.has(record.connectionId)) continue;
+        seenConnectionIds.add(record.connectionId);
+        targets.push(record);
       }
-      
-      // Filter to only connections for this document
-      const docConns = allUserConnections.filter(
-        conn => conn.documentId === documentId
+    };
+
+    if (connectionList && connectionList.length > 0) {
+      addTargets(connectionList);
+    } else {
+      // Always use fallback approach for better reliability with GSI eventual consistency
+      // First, try GSI query
+      const gsiTargets = await getConnectionsByDocument(documentId).catch(
+        (error) => {
+          console.error("Failed to fetch document connections via GSI:", error);
+          return [];
+        }
       );
-      
+
       console.log(
-        `[WS Handler] Fallback query found ${docConns.length} connection(s) for document ${documentId}`
+        `[WS Handler] GSI query found ${gsiTargets.length} connection(s) for document ${documentId}`
       );
-      
-      // Merge GSI results with fallback results, avoiding duplicates
-      const existingIds = new Set(gsiTargets.map(t => t.connectionId));
-      targets = [...gsiTargets];
-      for (const conn of docConns) {
-        if (!existingIds.has(conn.connectionId)) {
-          targets.push(conn);
+      addTargets(gsiTargets);
+
+      // Always also query by userId for all document collaborators as a fallback
+      // This works even if GSI hasn't updated yet
+      try {
+        const { getDocumentCollaborators, query } = await import("../db/pg");
+
+        const docResult = await query(
+          `SELECT owner_id FROM documents WHERE id = $1`,
+          [documentId]
+        );
+        const ownerId = docResult.rows[0]?.owner_id;
+
+        const collaborators = await getDocumentCollaborators(documentId);
+        const userIds = new Set<string>();
+        if (ownerId) userIds.add(ownerId);
+        collaborators.forEach((c) => userIds.add(c.userId));
+
+        console.log(
+          `[WS Handler] Found ${userIds.size} user(s) with access to document ${documentId} (owner + collaborators)`
+        );
+
+        const allUserConnections: ConnectionRecord[] = [];
+        for (const userId of userIds) {
+          const userConns = await getConnectionsByUser(userId);
+          allUserConnections.push(...userConns);
           console.log(
-            `[WS Handler] Added connection ${conn.connectionId} from fallback query (not found in GSI)`
+            `[WS Handler] User ${userId} has ${userConns.length} active connection(s)`
+          );
+        }
+
+        const docConns = allUserConnections.filter(
+          (conn) => conn.documentId === documentId
+        );
+
+        console.log(
+          `[WS Handler] Fallback query found ${docConns.length} connection(s) for document ${documentId}`
+        );
+        addTargets(docConns);
+      } catch (error) {
+        console.warn("Fallback connection query failed:", error);
+      }
+
+      // As a final fallback, scan all connections (best-effort, small scale)
+      if (targets.length === 0) {
+        try {
+          const allConnections = await listAllConnections();
+          const filtered = allConnections.filter(
+            (conn) => conn.documentId === documentId
+          );
+          console.log(
+            `[WS Handler] listAllConnections fallback found ${filtered.length} connection(s) for document ${documentId}`
+          );
+          addTargets(filtered);
+        } catch (error) {
+          console.warn(
+            "[WS Handler] listAllConnections fallback failed:",
+            error
           );
         }
       }
-      
-      console.log(
-        `[WS Handler] Total connections found for document ${documentId}: ${targets.length} (${gsiTargets.length} from GSI + ${docConns.length - gsiTargets.length} from fallback)`
-      );
-    } catch (error) {
-      // Fallback failed - use GSI results only
-      console.warn("Fallback connection query failed:", error);
-      targets = gsiTargets;
-    }
     }
 
     const filteredTargets = targets.filter(
@@ -922,6 +932,23 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
       }
 
       const message = JSON.parse(event.body || "{}");
+      
+      // Log the raw message for debugging (especially documentId)
+      if (message.action === "update") {
+        console.log(
+          `[WS Handler] Raw update message received:`,
+          {
+            action: message.action,
+            documentId: message.documentId,
+            documentIdType: typeof message.documentId,
+            documentIdLength: message.documentId?.length,
+            hasUpdate: !!message.update,
+            updateLength: message.update?.length,
+            connectionId
+          }
+        );
+      }
+      
       const validation = validateMessage(message);
       if (!validation.valid) {
         await sendErrorResponse(
@@ -946,6 +973,30 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
       }
 
       if (action === "join" && documentId) {
+        // Validate and trim documentId early
+        const trimmedDocumentId = documentId.trim();
+        if (!trimmedDocumentId || trimmedDocumentId === "") {
+          await sendErrorResponse(
+            connectionId,
+            "Invalid document ID format",
+            "INVALID_DOCUMENT_ID",
+            apiGatewayClient
+          );
+          return { statusCode: 400 };
+        }
+        
+        // Validate UUID format
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!uuidRegex.test(trimmedDocumentId)) {
+          await sendErrorResponse(
+            connectionId,
+            "Invalid document ID format",
+            "INVALID_DOCUMENT_ID",
+            apiGatewayClient
+          );
+          return { statusCode: 400 };
+        }
+        
         // Clean up any orphaned connections for this user (connections without a document)
         // This helps prevent connection accumulation when users reconnect
         try {
@@ -969,7 +1020,7 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
           console.error(`[WS Handler] Error during connection cleanup on join:`, error);
         }
 
-        const docConnections = await getDocumentConnectionCount(documentId);
+        const docConnections = await getDocumentConnectionCount(trimmedDocumentId);
         if (docConnections >= DOCUMENT_CONNECTION_LIMIT) {
           await sendErrorResponse(
             connectionId,
@@ -981,7 +1032,7 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
         }
 
         const syncData = await joinRoom(
-          documentId,
+          trimmedDocumentId,
           conn.userId,
           typeof lastKnownVersion === "number" ? lastKnownVersion : null
         );
@@ -997,13 +1048,17 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
         }
 
         // Set documentId in DynamoDB (non-blocking - GSI will update eventually)
-        await setConnectionDocument(connectionId, documentId);
+        await setConnectionDocument(connectionId, trimmedDocumentId);
         // Update in-memory cache
-        conn.documentId = documentId;
+        conn.documentId = trimmedDocumentId;
 
         console.log(
-          `[WS Handler] Connection ${connectionId} joined document ${documentId}`
+          `[WS Handler] Connection ${connectionId} joined document ${trimmedDocumentId} (userId: ${conn.userId})`
         );
+        
+        // Small delay to allow DynamoDB GSI to update (eventual consistency)
+        // This ensures subsequent broadcasts can find this connection
+        await new Promise((resolve) => setTimeout(resolve, 100));
 
         await sendChunkedSyncPayload({
           client: apiGatewayClient,
@@ -1015,18 +1070,60 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
 
         const presenceMeta = await getPresenceUserMetadata(conn.userId);
 
+        // Broadcast join event to other users (excludes the joining connection)
         await broadcastToRoom(
-          documentId,
+          trimmedDocumentId,
           {
-          type: "presence",
-          action: "join",
-          userId: conn.userId,
+            type: "presence",
+            action: "join",
+            userId: conn.userId,
             userName: presenceMeta.userName,
             email: presenceMeta.email,
             timestamp: Date.now(),
           },
           connectionId
         );
+
+        // Also send list of existing users to the newly joining user
+        // This ensures they see who's already connected
+        try {
+          const existingConnections = await getConnectionsByDocument(trimmedDocumentId);
+          const existingUserIds = new Set(
+            existingConnections
+              .filter((c) => c.connectionId !== connectionId && c.userId !== conn.userId)
+              .map((c) => c.userId)
+          );
+
+          if (existingUserIds.size > 0) {
+            const existingUsersMeta = await Promise.all(
+              Array.from(existingUserIds).map(async (userId) => {
+                const meta = await getPresenceUserMetadata(userId);
+                return {
+                  userId,
+                  userName: meta.userName,
+                  email: meta.email,
+                };
+              })
+            );
+
+            // Send existing users to the newly joining connection
+            await sendToConnection({
+              connectionId,
+              endpoint: endpoint,
+              data: {
+                type: "presence",
+                action: "existing_users",
+                users: existingUsersMeta,
+              },
+            });
+          }
+        } catch (error) {
+          // Log but don't fail - this is best effort
+          console.warn(
+            `[WS Handler] Failed to send existing users to new connection:`,
+            error
+          );
+        }
 
         await updateConnectionActivity(connectionId);
         return { statusCode: 200 };
@@ -1076,7 +1173,15 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
 
         const updateBuffer = Buffer.from(update, "base64");
         console.log(
-          `[WS Handler] Received update from user ${conn.userId} for document ${documentId}, size: ${updateBuffer.length} bytes`
+          `[WS Handler] Received update from user ${conn.userId} for document ${documentId}, size: ${updateBuffer.length} bytes`,
+          {
+            documentId,
+            documentIdType: typeof documentId,
+            documentIdLength: documentId?.length,
+            documentIdTrimmed: documentId?.trim(),
+            connectionId,
+            connDocumentId: conn.documentId
+          }
         );
         
         // Verify connection has documentId set
@@ -1117,42 +1222,103 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
           conn.documentId = refreshedConn.documentId;
         }
         
-        const shouldSnapshot = await saveOperation(
-          documentId,
-          updateBuffer,
-          connectionId
-        );
+        // Defensive check: ensure documentId is still valid before database call
+        // This catches any edge cases where documentId might have been corrupted
+        const finalDocumentId = documentId?.trim();
+        if (!finalDocumentId || finalDocumentId === "") {
+          console.error(
+            `[WS Handler] CRITICAL: documentId became invalid before saveOperation`,
+            { 
+              originalDocumentId: message.documentId,
+              currentDocumentId: documentId,
+              connDocumentId: conn.documentId,
+              connectionId 
+            }
+          );
+          await sendErrorResponse(
+            connectionId,
+            "Internal error: Invalid document ID",
+            "INTERNAL_ERROR",
+            apiGatewayClient
+          );
+          return { statusCode: 500 };
+        }
+        
+        // Validate UUID format one more time
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!uuidRegex.test(finalDocumentId)) {
+          console.error(
+            `[WS Handler] CRITICAL: documentId is not a valid UUID: "${finalDocumentId}"`
+          );
+          await sendErrorResponse(
+            connectionId,
+            "Internal error: Invalid document ID format",
+            "INTERNAL_ERROR",
+            apiGatewayClient
+          );
+          return { statusCode: 500 };
+        }
+        
+        // Save operation - but don't let failures block broadcasting
+        // Broadcasting is more important than persistence for real-time collaboration
+        let shouldSnapshot = false;
+        try {
+          shouldSnapshot = await saveOperation(
+            finalDocumentId,
+            updateBuffer,
+            connectionId
+          );
+        } catch (error) {
+          // Log error but continue - we still want to broadcast the update
+          // so other users see the changes even if persistence fails
+          console.error(
+            `[WS Handler] Failed to save operation for document ${finalDocumentId}:`,
+            error instanceof Error ? error.message : String(error)
+          );
+          // Don't return - continue to broadcast so users see the update
+        }
 
         // Get all connections for this document and broadcast
         // Note: GSI eventual consistency means we might not find all connections immediately,
         // but this is acceptable - subsequent updates will be broadcast correctly
         // Broadcast to all other connections in the room
+        // Use finalDocumentId to ensure we're using the validated, trimmed version
         const updateMessage = {
           type: "update",
-          documentId,
+          documentId: finalDocumentId,
           update: update,
         };
         console.log(
           `[WS Handler] Broadcasting update message:`,
           {
-            documentId,
+            documentId: finalDocumentId,
             updateSize: update.length,
             messageSize: JSON.stringify(updateMessage).length,
-            excludeConnectionId: connectionId
+            excludeConnectionId: connectionId,
+            senderUserId: conn.userId,
+            senderConnectionId: connectionId
           }
         );
         try {
+          // Always broadcast - broadcastToRoom has fallback logic to find connections
+          // Even if connection count is low, we should still try to broadcast
+          // The fallback will query by userId if GSI hasn't updated yet
+          console.log(
+            `[WS Handler] Broadcasting update for document ${finalDocumentId} (sender: ${conn.userId}, connectionId: ${connectionId})`
+          );
+          
           await broadcastToRoom(
-            documentId,
+            finalDocumentId,
             updateMessage,
             connectionId
           );
+          
           console.log(
-            `[WS Handler] Update broadcast completed for document ${documentId}`
+            `[WS Handler] Update broadcast completed for document ${finalDocumentId}`
           );
         } catch (error) {
           console.error(
-            `[WS Handler] Error broadcasting update for document ${documentId}:`,
+            `[WS Handler] Error broadcasting update for document ${finalDocumentId}:`,
             error
           );
           // Don't fail the request - the update was saved, just broadcast failed
@@ -1167,16 +1333,16 @@ export const handler: APIGatewayProxyWebsocketHandlerV2 = async (
           // If updates are small (normal typing), allow snapshots
           // If updates are large, the document is probably too big for snapshots
           if (docSize < 10000) { // Only request snapshots for reasonably sized documents
-            await broadcastToRoom(documentId, {
-            type: "snapshot_needed",
-            documentId,
-          });
-          } else {
-            console.log(
-              `[WS Handler] Skipping snapshot request for document ${documentId} - document appears too large`
-            );
+            await broadcastToRoom(finalDocumentId, {
+              type: "snapshot_needed",
+              documentId: finalDocumentId,
+            });
+            } else {
+              console.log(
+                `[WS Handler] Skipping snapshot request for document ${finalDocumentId} - document appears too large`
+              );
+            }
           }
-        }
 
         await updateConnectionActivity(connectionId);
         return { statusCode: 200 };

@@ -589,6 +589,43 @@ const Editor: React.FC = () => {
                 key: COLLAB_TOAST_KEYS.COLLABORATOR_PRESENT,
               }
             );
+          } else if (message.action === "existing_users") {
+            // Handle list of existing users when we first join
+            if (Array.isArray(message.users)) {
+              if (import.meta.env.DEV) {
+                console.log(
+                  `[Editor] Received ${message.users.length} existing user(s)`
+                );
+              }
+              setActiveUsers((prev) => {
+                const next = new Map(prev);
+                message.users.forEach((userInfo: any) => {
+                  if (userInfo.userId && userInfo.userId !== user?.id) {
+                    const userName =
+                      userInfo.userName ||
+                      userInfo.email?.split?.("@")?.[0] ||
+                      "Collaborator";
+                    next.set(userInfo.userId, {
+                      userId: userInfo.userId,
+                      userName,
+                      status: "online",
+                      joinedAt: Date.now(),
+                    });
+                  }
+                });
+                if (next.size > 0) {
+                  showToast(
+                    "Another user is editing. Changes will sync automatically.",
+                    {
+                      variant: "info",
+                      duration: 4000,
+                      key: COLLAB_TOAST_KEYS.COLLABORATOR_PRESENT,
+                    }
+                  );
+                }
+                return next;
+              });
+            }
           } else if (message.action === "leave") {
             setActiveUsers((prev) => {
               const next = new Map(prev);
@@ -734,6 +771,30 @@ const Editor: React.FC = () => {
         provider.on("error", handleProviderError);
         provider.on("latency", handleLatency);
         provider.on("sync-status", handleSyncStatusEvent);
+        
+        // Listen for refinement events
+        provider.on("refinement_started", () => {
+          showToast("AI is refining draft. Editing will be re-enabled shortly.", {
+            variant: "info",
+            duration: null,
+            key: COLLAB_TOAST_KEYS.AI_OPERATION,
+          });
+        });
+        
+        provider.on("refinement_complete", (event: any) => {
+          const payload = Array.isArray(event) ? event[0] : event;
+          if (payload?.text !== undefined) {
+            console.log(`[Editor] Refinement complete event received: ${payload.beforeLength} -> ${payload.afterLength} chars`);
+            // Y.js has already been updated, just sync the state
+            isApplyingRemoteUpdateRef.current = true;
+            setDraftText(payload.text);
+            setTimeout(() => {
+              isApplyingRemoteUpdateRef.current = false;
+            }, 0);
+          }
+          // Dismiss the AI operation toast
+          dismissToast(COLLAB_TOAST_KEYS.AI_OPERATION);
+        });
         
         // Listen for explicit remote update events
         provider.on("remote-update", (event: any) => {
@@ -1105,7 +1166,8 @@ const Editor: React.FC = () => {
         setDraftText(draftText);
         
         // Update Y.js with the new draft text so other users see the changes
-        if (yjsRef.current && yjsRef.current.provider.isSynced) {
+        // Update even if not fully synced - generation updates are authoritative
+        if (yjsRef.current && yjsRef.current.provider.ws?.readyState === WebSocket.OPEN) {
           const { ytext, ydoc } = yjsRef.current;
           // Replace entire Y.Text content with the new draft
           ydoc.transact(() => {
@@ -1118,7 +1180,7 @@ const Editor: React.FC = () => {
             }
           }, null);
           if (import.meta.env.DEV) {
-            console.log("[Editor] Updated Y.js with generated draft text");
+            console.log("[Editor] Updated Y.js with generated draft text (isSynced: " + yjsRef.current.provider.isSynced + ")");
           }
         }
         
@@ -1177,7 +1239,10 @@ const Editor: React.FC = () => {
         setDraftText(draftText);
         
         // Update Y.js with the refined draft text so other users see the changes
-        if (yjsRef.current && yjsRef.current.provider.isSynced) {
+        // Update even if not fully synced - refinement updates are authoritative
+        // Note: The refinement_complete event will also be broadcast, but updating
+        // locally ensures immediate UI update and sends the update to other users
+        if (yjsRef.current && yjsRef.current.provider.ws?.readyState === WebSocket.OPEN) {
           const { ytext, ydoc } = yjsRef.current;
           // Replace entire Y.Text content with the refined draft
           ydoc.transact(() => {
@@ -1190,7 +1255,7 @@ const Editor: React.FC = () => {
             }
           }, null);
           if (import.meta.env.DEV) {
-            console.log("[Editor] Updated Y.js with refined draft text");
+            console.log("[Editor] Updated Y.js with refined draft text (isSynced: " + yjsRef.current.provider.isSynced + ")");
           }
         }
         

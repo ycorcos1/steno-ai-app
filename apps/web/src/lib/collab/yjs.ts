@@ -110,7 +110,7 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
         // Emit connected status
         // Use a small delay to ensure React has processed listener registration
         setTimeout(() => {
-      this.emit("status", [{ status: "connected" }]);
+          this.emit("status", [{ status: "connected" }]);
         }, 10);
 
         // Start latency monitoring
@@ -122,10 +122,22 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
           if (ws.readyState === WebSocket.OPEN && this.ws === ws) {
             // Send join message with lastKnownVersion for efficient sync
             try {
+              // Validate documentId before sending join
+              const trimmedDocId = this.documentId.trim();
+              const uuidRegex =
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+              if (!uuidRegex.test(trimmedDocId)) {
+                console.error(
+                  "[Y.js] Cannot send join: documentId is not a valid UUID",
+                  { documentId: this.documentId, trimmed: trimmedDocId }
+                );
+                return;
+              }
+
               ws.send(
                 JSON.stringify({
-        action: "join",
-        documentId: this.documentId,
+                  action: "join",
+                  documentId: trimmedDocId,
                   lastKnownVersion: this.lastKnownVersion,
                 })
               );
@@ -165,7 +177,9 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
             hasUpdate: !!message.update,
             updateLength: message.update?.length || 0,
             documentId: message.documentId,
-            messageSize: event.data.length
+            messageSize: event.data.length,
+            expectedDocumentId: this.documentId,
+            documentIdMatch: message.documentId === this.documentId,
           });
         } else if (import.meta.env.DEV) {
           console.log(`[Y.js] Raw message received:`, {
@@ -173,13 +187,27 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
             hasUpdate: !!message.update,
             hasSnapshot: !!message.snapshot,
             hasOps: !!(message.ops && message.ops.length > 0),
-            messageSize: event.data.length
+            messageSize: event.data.length,
           });
         }
+        // Log sync messages to debug isSynced issue
+        if (message.type === "sync" || message.type === "sync_complete") {
+          console.log(
+            `[Y.js] Processing ${message.type} message, current isSynced: ${this.isSynced}`
+          );
+        }
+
         this.handleMessage(message);
+
+        // Log isSynced after processing sync messages
+        if (message.type === "sync" || message.type === "sync_complete") {
+          console.log(
+            `[Y.js] After processing ${message.type}, isSynced: ${this.isSynced}`
+          );
+        }
       } catch (error) {
         console.error("[Y.js] Failed to parse message:", error, {
-          data: event.data?.substring(0, 200)
+          data: event.data?.substring(0, 200),
         });
       }
     };
@@ -187,22 +215,46 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
     this.ws.onerror = (error) => {
       // Only log errors in development or if connection fails multiple times
       if (this.reconnectAttempts > 2) {
-        console.error("[Y.js] WebSocket error (attempt", this.reconnectAttempts + "):", error);
+        console.error(
+          "[Y.js] WebSocket error (attempt",
+          this.reconnectAttempts + "):",
+          error
+        );
       }
       this.emit("status", [{ status: "error", message: "websocket-error" }]);
     };
 
     this.ws.onclose = (event) => {
+      const wasSynced = this.isSynced;
       this.isSynced = false;
 
-      // Only log abnormal closures (1006) after multiple attempts
-      // Many 1006 errors are transient and will be retried automatically
-      if (event.code === 1006 && this.reconnectAttempts > 3) {
+      if (import.meta.env.DEV) {
+        console.log(
+          `[Y.js] WebSocket closed: code=${event.code}, wasSynced=${wasSynced}, willReconnect=${this.shouldConnect}`
+        );
+      }
+
+      // Code 1005 means "No Status Received" - connection closed without proper handshake
+      // This often happens with API Gateway WebSockets and is usually recoverable
+      if (event.code === 1005) {
+        if (import.meta.env.DEV) {
+          console.log(
+            `[Y.js] WebSocket closed (code 1005 - No Status Received). Will reconnect.`
+          );
+        }
+      } else if (event.code === 1006 && this.reconnectAttempts > 3) {
+        // Only log abnormal closures (1006) after multiple attempts
+        // Many 1006 errors are transient and will be retried automatically
         console.warn(
           `[Y.js] WebSocket closed abnormally (code 1006) after ${this.reconnectAttempts} attempts`
         );
-      } else if (event.code !== 1000 && event.code !== 1001 && event.code !== 1006) {
-        // Log non-normal, non-1006 closures (these are less common)
+      } else if (
+        event.code !== 1000 &&
+        event.code !== 1001 &&
+        event.code !== 1006 &&
+        event.code !== 1005
+      ) {
+        // Log non-normal, non-1006, non-1005 closures (these are less common)
         console.warn(`[Y.js] WebSocket closed:`, {
           code: event.code,
           reason: event.reason || "No reason provided",
@@ -211,7 +263,9 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
       }
 
       // Emit disconnected status
-      this.emit("status", [{ status: "disconnected", code: event.code, reason: event.reason }]);
+      this.emit("status", [
+        { status: "disconnected", code: event.code, reason: event.reason },
+      ]);
 
       // Only attempt reconnect if connection was not intentionally closed
       if (this.shouldConnect) {
@@ -272,11 +326,11 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
     ]);
 
     this.reconnectTimeoutId = window.setTimeout(() => {
-          if (this.shouldConnect) {
-            this.connect();
-          }
-        }, delay);
+      if (this.shouldConnect) {
+        this.connect();
       }
+    }, delay);
+  }
 
   private startLatencyMonitoring(): void {
     // Clear any existing interval
@@ -391,28 +445,36 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
       try {
         const messageStr = JSON.stringify(data);
         const messageSize = new Blob([messageStr]).size;
-        
+
         // API Gateway WebSocket has 32KB limit, use 28KB to be safe
         const MAX_MESSAGE_SIZE = 28 * 1024;
-        
+
         if (messageSize > MAX_MESSAGE_SIZE) {
           console.error(
-            `[Y.js] Message too large (${(messageSize / 1024).toFixed(2)}KB). Maximum is ${(MAX_MESSAGE_SIZE / 1024).toFixed(2)}KB.`,
+            `[Y.js] Message too large (${(messageSize / 1024).toFixed(
+              2
+            )}KB). Maximum is ${(MAX_MESSAGE_SIZE / 1024).toFixed(2)}KB.`,
             { action: data?.action, size: messageSize }
           );
           this.emit("error", [
             {
               type: "message_too_large",
-              message: `Message exceeds ${(MAX_MESSAGE_SIZE / 1024).toFixed(2)}KB limit`,
+              message: `Message exceeds ${(MAX_MESSAGE_SIZE / 1024).toFixed(
+                2
+              )}KB limit`,
               size: messageSize,
             },
           ]);
           return;
         }
-        
+
         this.ws.send(messageStr);
         if (import.meta.env.DEV && data?.action !== "update") {
-          console.log(`[Y.js] Message sent: ${data?.action} (${(messageSize / 1024).toFixed(2)}KB)`);
+          console.log(
+            `[Y.js] Message sent: ${data?.action} (${(
+              messageSize / 1024
+            ).toFixed(2)}KB)`
+          );
         }
       } catch (error) {
         console.error("[Y.js] Error sending message:", error);
@@ -486,7 +548,9 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
       this.awaitingSyncCompletion = true;
       this.setSyncStatus("syncing");
       const chunkOps: string[] = Array.isArray(message.ops)
-        ? message.ops.filter((item: unknown): item is string => typeof item === "string")
+        ? message.ops.filter(
+            (item: unknown): item is string => typeof item === "string"
+          )
         : [];
       const startIndex =
         typeof message.startIndex === "number"
@@ -494,10 +558,10 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
           : this.nextExpectedOpIndex;
 
       if (this.nextExpectedOpIndex !== startIndex) {
-        console.warn(
-          "[Y.js] Sync ops chunk arrived out of order",
-          { expected: this.nextExpectedOpIndex, receivedStart: startIndex }
-        );
+        console.warn("[Y.js] Sync ops chunk arrived out of order", {
+          expected: this.nextExpectedOpIndex,
+          receivedStart: startIndex,
+        });
         this.nextExpectedOpIndex = startIndex;
       }
 
@@ -536,10 +600,7 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
 
       const fragmentState = this.pendingOpFragments.get(opIndex);
       if (fragmentState) {
-        if (
-          fragmentIndex >= 0 &&
-          fragmentIndex < fragmentState.fragmentCount
-        ) {
+        if (fragmentIndex >= 0 && fragmentIndex < fragmentState.fragmentCount) {
           fragmentState.fragments[fragmentIndex] = data;
         }
 
@@ -553,10 +614,10 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
             const opBuffer = this.base64ToUint8Array(combined);
 
             if (this.nextExpectedOpIndex !== opIndex) {
-              console.warn(
-                "[Y.js] Op fragment completed out of order",
-                { expected: this.nextExpectedOpIndex, opIndex }
-              );
+              console.warn("[Y.js] Op fragment completed out of order", {
+                expected: this.nextExpectedOpIndex,
+                opIndex,
+              });
               this.nextExpectedOpIndex = opIndex;
             }
 
@@ -586,32 +647,48 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
         typeof message.opCount === "number" &&
         this.nextExpectedOpIndex !== message.opCount
       ) {
-        console.warn(
-          "[Y.js] Sync completed but applied op count mismatch",
-          {
-            expected: message.opCount,
-            applied: this.nextExpectedOpIndex,
-          }
-        );
+        console.warn("[Y.js] Sync completed but applied op count mismatch", {
+          expected: message.opCount,
+          applied: this.nextExpectedOpIndex,
+        });
         this.nextExpectedOpIndex = message.opCount;
       }
       this.pendingOpFragments.clear();
       this.expectedSnapshotChunks = null;
       this.snapshotChunkBuffer = [];
       this.receivedSnapshotChunks = 0;
+      const beforeIsSynced = this.isSynced;
       this.isSynced = true;
       this.awaitingSyncCompletion = false;
       this.setSyncStatus("synced");
-      this.emit("synced", [
-        { synced: true, version: this.lastKnownVersion },
-      ]);
+      console.log(
+        `[Y.js] Set isSynced: ${beforeIsSynced} -> ${this.isSynced} after receiving sync_complete message`
+      );
+      this.emit("synced", [{ synced: true, version: this.lastKnownVersion }]);
+
+      // Verify isSynced is actually true
+      if (!this.isSynced) {
+        console.error(
+          `[Y.js] CRITICAL: isSynced should be true but is ${this.isSynced} after sync_complete message!`
+        );
+        this.isSynced = true; // Force it to true
+      }
       return;
     }
 
     if (type === "sync") {
+      console.log(`[Y.js] Received sync message:`, {
+        hasSnapshot: !!snapshot,
+        snapshotLength: snapshot?.length || 0,
+        opsCount: Array.isArray(ops) ? ops.length : 0,
+        version,
+        currentIsSynced: this.isSynced,
+      });
+
       if (snapshot) {
         const snapshotBuffer = this.base64ToUint8Array(snapshot);
         Y.applyUpdate(this.doc, snapshotBuffer, this);
+        console.log(`[Y.js] Applied snapshot from sync message`);
       }
 
       for (const op of ops || []) {
@@ -622,69 +699,94 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
       if (Array.isArray(ops)) {
         this.nextExpectedOpIndex = ops.length;
         this.totalOpsExpected = ops.length;
+        console.log(`[Y.js] Applied ${ops.length} ops from sync message`);
       }
 
       if (version !== undefined && version !== null) {
         this.lastKnownVersion = version;
       }
 
+      const beforeIsSynced = this.isSynced;
       this.isSynced = true;
       this.awaitingSyncCompletion = false;
       this.setSyncStatus("synced");
+      console.log(
+        `[Y.js] Set isSynced: ${beforeIsSynced} -> ${this.isSynced} after receiving sync message`
+      );
       this.emit("synced", [{ synced: true, version: this.lastKnownVersion }]);
+
+      // Verify isSynced is actually true
+      if (!this.isSynced) {
+        console.error(
+          `[Y.js] CRITICAL: isSynced should be true but is ${this.isSynced} after sync message!`
+        );
+        this.isSynced = true; // Force it to true
+      }
     } else if (type === "update") {
       if (update) {
         console.log(
           `[Y.js] Received remote update message (size: ${update.length} chars)`
         );
         try {
-        const updateBuffer = Uint8Array.from(atob(update), (c) =>
-          c.charCodeAt(0)
-        );
+          const updateBuffer = Uint8Array.from(atob(update), (c) =>
+            c.charCodeAt(0)
+          );
           // Apply update with null origin to allow it to be applied
           // Using null origin ensures Y.js applies the update and triggers observers
           // Using 'this' (provider) would cause Y.js to ignore it as an echo
           const ytext = this.doc.getText("draft");
           const beforeLength = ytext.length;
           const beforeText = ytext.toString().substring(0, 100); // First 100 chars for comparison
-          
+
           // Log the update buffer size to debug
           console.log(
-            `[Y.js] Applying remote update: buffer size=${updateBuffer.length} bytes, beforeLength=${beforeLength}`
+            `[Y.js] Applying remote update: buffer size=${updateBuffer.length} bytes, beforeLength=${beforeLength}, isSynced=${this.isSynced}`
           );
-          
-          Y.applyUpdate(this.doc, updateBuffer, null);
-          
-          const afterLength = ytext.length;
-          const afterText = ytext.toString().substring(0, 100);
-          this.setSyncStatus("synced");
-          
-          console.log(
-            `[Y.js] Remote update applied: ${beforeLength} -> ${afterLength} chars`,
-            { 
-              textChanged: beforeText !== afterText,
-              beforePreview: beforeText.substring(0, 50),
-              afterPreview: afterText.substring(0, 50)
-            }
-          );
-          
-          // Explicitly emit a change event to ensure React updates
-          // ytext.observe should fire, but this ensures we catch it
-          // Use setTimeout to ensure Y.js has fully processed the update
-          setTimeout(() => {
+
+          // Apply the update - this will trigger ytext.observe handlers
+          // Use a special marker object as origin to identify remote updates
+          // This prevents the update from being echoed back to the server
+          const REMOTE_UPDATE_ORIGIN = { __isRemoteUpdate: true };
+          Y.applyUpdate(this.doc, updateBuffer, REMOTE_UPDATE_ORIGIN);
+
+          // Use requestAnimationFrame to ensure Y.js has fully processed the update
+          // before we read the text and emit events
+          requestAnimationFrame(() => {
+            const afterLength = ytext.length;
+            const afterText = ytext.toString().substring(0, 100);
+            this.setSyncStatus("synced");
+
+            console.log(
+              `[Y.js] Remote update applied: ${beforeLength} -> ${afterLength} chars`,
+              {
+                textChanged: beforeText !== afterText,
+                beforePreview: beforeText.substring(0, 50),
+                afterPreview: afterText.substring(0, 50),
+              }
+            );
+
+            // Emit remote-update event to ensure React updates
+            // This is a fallback in case ytext.observe doesn't fire
             const finalText = ytext.toString();
-            this.emit("remote-update", [{ 
-              beforeLength, 
-              afterLength,
-              text: finalText
-            }]);
-          }, 0);
+            this.emit("remote-update", [
+              {
+                beforeLength,
+                afterLength,
+                text: finalText,
+              },
+            ]);
+          });
         } catch (error) {
           console.error("[Y.js] Error applying remote update:", error);
-          this.emit("error", [{
-            type: "update_apply_failed",
-            message: error instanceof Error ? error.message : "Failed to apply remote update"
-          }]);
+          this.emit("error", [
+            {
+              type: "update_apply_failed",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to apply remote update",
+            },
+          ]);
         }
       }
     } else if (type === "error") {
@@ -692,9 +794,7 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
         code: message.code ?? error?.code,
         type: (message.code ?? error?.code ?? "generic").toLowerCase(),
         message:
-          error?.message ??
-          message.message ??
-          "Collaboration error occurred",
+          error?.message ?? message.message ?? "Collaboration error occurred",
         details: error ?? message,
       };
 
@@ -707,12 +807,29 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
         return;
       }
 
+      // Ignore INTERNAL_ERROR related to invalid UUID - it's being handled on server
+      // and shouldn't break the connection
+      if (
+        normalized.type === "internal_error" &&
+        normalized.message?.includes("invalid input syntax for type uuid")
+      ) {
+        console.warn(
+          "[Y.js] Server reported UUID error (being handled):",
+          normalized.message
+        );
+        // Don't break connection - server is handling it
+        return;
+      }
+
       if (normalized.type === "sync_conflict") {
         this.setSyncStatus("conflict");
       }
 
       if (normalized.type === "invalid_document") {
-        console.warn("[Y.js] Server reported invalid document for this connection. Forcing reconnect.", normalized);
+        console.warn(
+          "[Y.js] Server reported invalid document for this connection. Forcing reconnect.",
+          normalized
+        );
         this.isSynced = false;
         this.emit("status", [
           {
@@ -726,13 +843,51 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
 
       console.error("[Y.js] Server error:", normalized);
       this.emit("error", [normalized]);
+    } else if (type === "refinement_started") {
+      // Emit refinement_started event so Editor can show notification
+      this.emit("refinement_started", [message]);
+    } else if (type === "refinement_complete") {
+      // Apply the refined text to Y.js so all collaborators see it
+      // Apply even if not fully synced - refinement updates are authoritative
+      if (message.draftText) {
+        const ytext = this.doc.getText("draft");
+        const beforeLength = ytext.length;
+
+        // Replace entire Y.Text content with the refined draft
+        // Use REMOTE_UPDATE_ORIGIN to prevent echo back to server
+        // The server already has the refined text, so we don't need to send it back
+        const REMOTE_UPDATE_ORIGIN = { __isRemoteUpdate: true };
+        this.doc.transact(() => {
+          if (beforeLength > 0) {
+            ytext.delete(0, beforeLength);
+          }
+          if (message.draftText.length > 0) {
+            ytext.insert(0, message.draftText);
+          }
+        }, REMOTE_UPDATE_ORIGIN);
+
+        const afterLength = ytext.length;
+        console.log(
+          `[Y.js] Applied refinement_complete: ${beforeLength} -> ${afterLength} chars (isSynced: ${this.isSynced})`
+        );
+
+        // Emit event so Editor can update UI
+        this.emit("refinement_complete", [
+          {
+            beforeLength,
+            afterLength,
+            text: message.draftText,
+          },
+        ]);
+      }
     } else if (type === "presence") {
       this.emit("presence", [message]);
     } else if (type === "snapshot_needed") {
       // Only attempt snapshot if document is reasonably sized
       // Large documents will rely on incremental updates
       const currentSize = this.doc.getText("draft").length;
-      if (currentSize > 50000) { // ~50KB of text
+      if (currentSize > 50000) {
+        // ~50KB of text
         console.warn(
           `[Y.js] Skipping snapshot - document is too large (${currentSize} chars). Will rely on incremental updates.`
         );
@@ -761,42 +916,85 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
    */
   sendUpdate(update: Uint8Array): void {
     // Validate documentId before sending
-    if (!this.documentId || typeof this.documentId !== "string" || this.documentId.trim() === "") {
+    if (
+      !this.documentId ||
+      typeof this.documentId !== "string" ||
+      this.documentId.trim() === ""
+    ) {
       console.error(
         "[Y.js] Cannot send update: documentId is missing or invalid",
-        { documentId: this.documentId }
+        { documentId: this.documentId, type: typeof this.documentId }
       );
       return;
     }
-    
+
+    // Ensure documentId is trimmed and valid before proceeding
+    const trimmedDocId = this.documentId.trim();
+    if (trimmedDocId === "") {
+      console.error(
+        "[Y.js] Cannot send update: documentId is empty after trimming",
+        { originalDocumentId: this.documentId }
+      );
+      return;
+    }
+
     // Y.js updates should be small incremental changes
     // If they're large, something is wrong - log a warning
     const updateSizeKB = update.length / 1024;
     if (updateSizeKB > 10) {
       console.warn(
-        `[Y.js] Large update detected (${updateSizeKB.toFixed(2)}KB). This may fail.`,
+        `[Y.js] Large update detected (${updateSizeKB.toFixed(
+          2
+        )}KB). This may fail.`,
         "Y.js updates should be small incremental changes."
       );
     }
-    
+
     this.setSyncStatus("syncing");
     this.scheduleSyncedTransition();
     // Use chunked base64 encoding for large updates too
     const base64 = this.uint8ArrayToBase64(update);
-    
+
     // Estimate message size (base64 is ~33% larger than binary)
     const estimatedSize = base64.length + 200; // Add overhead for JSON metadata
     if (estimatedSize > 28 * 1024) {
       console.error(
-        `[Y.js] Update too large to send (${(estimatedSize / 1024).toFixed(2)}KB). Skipping.`,
+        `[Y.js] Update too large to send (${(estimatedSize / 1024).toFixed(
+          2
+        )}KB). Skipping.`,
         "This usually means the entire document state is being sent instead of just changes."
       );
       return;
     }
-    
+
+    // Final validation before sending - ensure documentId is valid UUID
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(trimmedDocId)) {
+      console.error(
+        "[Y.js] Cannot send update: documentId is not a valid UUID",
+        {
+          documentId: this.documentId,
+          trimmed: trimmedDocId,
+          length: trimmedDocId.length,
+        }
+      );
+      return;
+    }
+
+    // Only send if WebSocket is open (double-check here for safety)
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      if (import.meta.env.DEV) {
+        console.warn("[Y.js] Cannot send update: WebSocket not open", {
+          readyState: this.ws?.readyState,
+        });
+      }
+      return;
+    }
+
     this.send({
       action: "update",
-      documentId: this.documentId,
+      documentId: trimmedDocId,
       update: base64,
     });
   }
@@ -821,8 +1019,7 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
       this.emit("error", [
         {
           type: "manual_sync_failed",
-          message:
-            err instanceof Error ? err.message : "Manual sync failed",
+          message: err instanceof Error ? err.message : "Manual sync failed",
         },
       ]);
       return false;
@@ -850,7 +1047,7 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
   private uint8ArrayToBase64(bytes: Uint8Array): string {
     // Use chunked approach to avoid call stack overflow for large arrays
     const chunkSize = 8192; // Process in 8KB chunks
-    let result = '';
+    let result = "";
     for (let i = 0; i < bytes.length; i += chunkSize) {
       const chunk = bytes.slice(i, i + chunkSize);
       result += btoa(String.fromCharCode(...chunk));
@@ -871,38 +1068,42 @@ export class ApiGatewayWebSocketProvider extends Observable<string> {
       const encodedState = Y.encodeStateAsUpdate(this.doc);
       // Use chunked base64 encoding to avoid stack overflow for large documents
       const base64 = this.uint8ArrayToBase64(encodedState);
-      
+
       // Check if snapshot is too large (API Gateway has 32KB limit)
       const sizeKB = encodedState.length / 1024;
       const estimatedMessageSize = base64.length + 200; // Add JSON overhead
-      
+
       if (estimatedMessageSize > 28 * 1024) {
         console.error(
-          `[Y.js] Snapshot too large (${(estimatedMessageSize / 1024).toFixed(2)}KB). Cannot send.`,
+          `[Y.js] Snapshot too large (${(estimatedMessageSize / 1024).toFixed(
+            2
+          )}KB). Cannot send.`,
           "Document is too large for WebSocket. Consider splitting the document."
         );
         this.isSnapshotting = false;
         this.emit("error", [
           {
             type: "snapshot_too_large",
-            message: `Snapshot exceeds ${(28 * 1024 / 1024).toFixed(2)}KB limit. Document is too large.`,
+            message: `Snapshot exceeds ${((28 * 1024) / 1024).toFixed(
+              2
+            )}KB limit. Document is too large.`,
             size: estimatedMessageSize,
           },
         ]);
         return;
       }
-      
+
       if (sizeKB > 20) {
         console.warn(
           `[Y.js] Snapshot is large (${sizeKB.toFixed(2)}KB). This may be slow.`
         );
       }
-      
-    this.send({
-      action: "create_snapshot",
-      documentId: this.documentId,
-      update: base64,
-    });
+
+      this.send({
+        action: "create_snapshot",
+        documentId: this.documentId,
+        update: base64,
+      });
     } catch (error) {
       console.error("[Y.js] Error encoding snapshot:", error);
       this.isSnapshotting = false;
@@ -938,26 +1139,45 @@ export function initCollabDoc(
 
   ydoc.on("update", (update: Uint8Array, origin: any) => {
     // Only send updates if:
-    // 1. The update didn't come from the provider (avoid echo)
-    // 2. The connection is established (isSynced means we've joined)
+    // 1. The update didn't come from the provider (avoid echo from sync messages)
+    // 2. The update didn't come from a remote update (marked with __isRemoteUpdate)
+    // 3. The WebSocket connection is open
+    // Note: We send updates even if not fully synced - the server will handle it
+    // This ensures manual edits are sent immediately when connection is open
+    const isRemoteUpdate =
+      origin && typeof origin === "object" && origin.__isRemoteUpdate === true;
+
     if (
       origin !== provider &&
-      provider.isSynced &&
+      !isRemoteUpdate &&
       provider.ws?.readyState === WebSocket.OPEN
     ) {
       console.log(
-        `[Y.js] Sending local update to server (size: ${update.length} bytes, isSynced: ${provider.isSynced})`
+        `[Y.js] Sending local update to server (size: ${
+          update.length
+        } bytes, isSynced: ${provider.isSynced}, origin: ${
+          origin === null ? "null" : typeof origin
+        })`
       );
       provider.sendUpdate(update);
-    } else if (origin !== provider && import.meta.env.DEV) {
-      console.log(
-        `[Y.js] Not sending update:`,
-        {
-          origin: origin === provider ? "provider" : origin === null ? "null" : "other",
+    } else if (origin !== provider && !isRemoteUpdate) {
+      // If we can't send now, log why but don't lose the update
+      // Y.js will handle retrying when connection is restored
+      if (import.meta.env.DEV) {
+        console.log(`[Y.js] Not sending update (will retry when connected):`, {
+          origin:
+            origin === provider
+              ? "provider"
+              : isRemoteUpdate
+              ? "remote-update"
+              : origin === null
+              ? "null"
+              : "other",
           isSynced: provider.isSynced,
           wsReady: provider.ws?.readyState === WebSocket.OPEN,
-        }
-      );
+          wsState: provider.ws?.readyState,
+        });
+      }
     }
   });
 

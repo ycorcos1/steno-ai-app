@@ -10,6 +10,8 @@ import {
   InvokeCommand,
   InvokeCommandInput,
 } from "@aws-sdk/client-lambda";
+import { checkActiveCollaborators } from "../realtime/connections";
+import { broadcastToDocument } from "../realtime/broadcast";
 
 const router = express.Router();
 router.use(express.json({ limit: '10mb' }));
@@ -83,6 +85,18 @@ router.post(
           error: "No draft to refine. Please generate a draft first.",
         });
       }
+
+      // Check if there are active collaborators (for logging)
+      const hasActiveCollaborators = await checkActiveCollaborators(documentId);
+
+      // Always broadcast refinement_started event - broadcastToDocument will handle no connections gracefully
+      await broadcastToDocument(documentId, {
+        type: "refinement_started",
+        documentId,
+      }).catch((error) => {
+        // Log but don't fail refinement if broadcast fails
+        console.warn("Failed to broadcast refinement_started:", error);
+      });
 
       // Compose refinement prompt
       const refinementPrompt = `You are a legal drafting assistant. Refine the following draft according to the user's request. Maintain professional tone and legal formatting.
@@ -192,6 +206,17 @@ IMPORTANT: Return ONLY the refined draft text. Do not include any introductory t
          WHERE id = $2`,
         [refinedText, documentId]
       );
+
+      // Always broadcast refinement_complete event - broadcastToDocument will handle no connections gracefully
+      // This ensures all connected users see the refinement, even if checkActiveCollaborators missed them
+      await broadcastToDocument(documentId, {
+        type: "refinement_complete",
+        documentId,
+        draftText: refinedText,
+      }).catch((error) => {
+        // Log but don't fail refinement if broadcast fails
+        console.warn("Failed to broadcast refinement_complete:", error);
+      });
 
       // Return response
       res.json({

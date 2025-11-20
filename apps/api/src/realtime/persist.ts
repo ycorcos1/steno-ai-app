@@ -30,13 +30,32 @@ export async function joinRoom(
   ops: Buffer[];
   version: number | null;
 } | null> {
+  // CRITICAL: Validate documentId before any database operations
+  if (!documentId || typeof documentId !== "string") {
+    console.error(`joinRoom: Invalid documentId type: ${typeof documentId}`);
+    return null;
+  }
+  
+  const trimmedId = documentId.trim();
+  if (trimmedId === "") {
+    console.error(`joinRoom: documentId is empty`);
+    return null;
+  }
+  
+  // Validate UUID format
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(trimmedId)) {
+    console.error(`joinRoom: documentId is not a valid UUID: "${trimmedId}"`);
+    return null;
+  }
+  
   // Check access
-  const access = await checkDocumentAccess(documentId, userId);
+  const access = await checkDocumentAccess(trimmedId, userId);
   if (!access) {
     return null;
   }
 
-  return getSyncData(documentId, lastKnownVersion);
+  return getSyncData(trimmedId, lastKnownVersion);
 }
 
 /**
@@ -51,11 +70,28 @@ export async function saveOperation(
   opBytes: Buffer,
   sessionId: string
 ): Promise<boolean> {
-  // Save the operation
-  await saveOp(documentId, opBytes, sessionId);
+  // CRITICAL: Validate documentId before calling saveOp
+  // This is an additional safety check even though ws_handler should have validated it
+  if (!documentId || typeof documentId !== "string") {
+    throw new Error(`saveOperation: documentId must be a non-empty string, got: ${typeof documentId} "${documentId}"`);
+  }
+  
+  const trimmedId = documentId.trim();
+  if (trimmedId === "") {
+    throw new Error(`saveOperation: documentId cannot be empty or whitespace`);
+  }
+  
+  // Validate UUID format
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(trimmedId)) {
+    throw new Error(`saveOperation: documentId must be a valid UUID, got: "${trimmedId}"`);
+  }
+  
+  // Save the operation (saveOp will also validate, but this catches it earlier)
+  await saveOp(trimmedId, opBytes, sessionId);
 
-  // Check if snapshot is needed
-  const opCount = await countOpsSinceLastSnapshot(documentId);
+  // Check if snapshot is needed (use trimmedId to ensure consistency)
+  const opCount = await countOpsSinceLastSnapshot(trimmedId);
   const now = Date.now();
   const lastSnapshot = lastSnapshotTime.get(documentId) || 0;
   const timeSinceSnapshot = (now - lastSnapshot) / 1000 / 60; // minutes
